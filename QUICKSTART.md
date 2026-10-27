@@ -20,7 +20,7 @@ python3 dt_appservice_fleet.py assess --all-subscriptions --rest
 
 # scope + per-app startup/DT state + write a report (format from file extension)
 python3 dt_appservice_fleet.py assess \
-    --subscription-filter prod --name-filter "web-*" \
+    --subscription prod --app-service-name "web-*" \
     --detailed --rest --output-file reports/prod.md
 ```
 
@@ -28,14 +28,14 @@ python3 dt_appservice_fleet.py assess \
 
 ```bash
 python3 dt_appservice_fleet.py deploy \
-    --subscription-filter prod --name-filter "web-*" --rest --what-if
+    --subscription prod --app-service-name "web-*" --rest --what-if
 ```
 
 ## 3. Deploy (resumable)
 
 ```bash
 python3 dt_appservice_fleet.py deploy \
-    --subscription-filter prod --name-filter "web-*" \
+    --subscription prod --app-service-name "web-*" \
     --rest --resilient --state-file rollout.jsonl --yes -v
 ```
 Interrupted? Re-run the **exact same command** — it skips the apps already done
@@ -45,7 +45,7 @@ Interrupted? Re-run the **exact same command** — it skips the apps already don
 
 ```bash
 python3 dt_appservice_fleet.py uninstall \
-    --subscription-filter prod --name-filter "web-*" --rest --yes
+    --subscription prod --app-service-name "web-*" --rest --yes
 ```
 
 ---
@@ -54,8 +54,8 @@ python3 dt_appservice_fleet.py uninstall \
 
 | Flag | What it does |
 |---|---|
-| `--subscription` / `--subscription-filter` / `--all-subscriptions` | scope by subscription (filter = name substring, or glob with `* ? [`) |
-| `--name-filter` / `--resource-group` | narrow to specific apps (name supports globs) |
+| `--subscription GUID\|NAME` / `--all-subscriptions` | scope by subscription — a GUID, or a name (substring or glob with `* ? [`). Repeatable. |
+| `--app-service-name` / `--resource-group` | narrow to specific apps (name: substring or glob) |
 | `--what-if` | show what *would* happen, change nothing |
 | `--rest` | use ARM REST instead of `az` — **~30× faster when `az` is slow** |
 | `--resilient` | persist agent to `/home` (no re-download on restart) + fail-open |

@@ -738,25 +738,31 @@ def list_subscriptions():
     return list_subscriptions_rest() if USE_REST else list_subscriptions_az()
 
 
+def _sub_matches(args, s):
+    """Each --subscription value matches by exact GUID (id) or, if not a GUID, as a
+    name substring/glob against the subscription's display name."""
+    if args.all_subscriptions:
+        return True
+    if not args.subscription:
+        return False
+    sid, name = s.get("id", ""), s.get("name", "")
+    for v in args.subscription:
+        if _GUID_RE.match(v):
+            if v.lower() == sid.lower():
+                return True
+        elif _matches_any([v], name):
+            return True
+    return False
+
+
 def _pick_subs(subs, args):
-    chosen = []
-    for s in subs:
-        if s.get("state") != "Enabled":
-            continue
-        name, sid = s.get("name", ""), s.get("id", "")
-        if args.all_subscriptions:
-            chosen.append(s)
-        elif args.subscription and (sid in args.subscription or name in args.subscription):
-            chosen.append(s)
-        elif args.subscription_filter and _matches_any(args.subscription_filter, name):
-            chosen.append(s)
-    return chosen
+    return [s for s in subs if s.get("state") == "Enabled" and _sub_matches(args, s)]
 
 
 def resolve_subscriptions(args):
     subs = list_subscriptions()
     chosen = _pick_subs(subs, args)
-    want_scope = bool(args.subscription or args.subscription_filter or args.all_subscriptions)
+    want_scope = bool(args.subscription or args.all_subscriptions)
 
     # ARM REST /subscriptions is SINGLE-tenant (the token's home tenant). If a scope
     # was requested but didn't fully resolve, enumerate across tenants via az and
@@ -776,22 +782,23 @@ def resolve_subscriptions(args):
             subs = list(merged.values())
             chosen = _pick_subs(subs, args)
 
-    # Trust explicit subscription IDs even if still not enumerated (e.g. a tenant
-    # az isn't logged into) — we mint that tenant's token on demand.
+    # Per-value resolution: a GUID not yet matched is trusted (minted on demand);
+    # a name/glob that matched nothing is reported.
     if args.subscription:
         by_id = {s.get("id"): s for s in subs}
         have = {s.get("id") for s in chosen}
+        chosen_names = {s.get("name") for s in chosen}
         for val in args.subscription:
-            if val in have:
-                continue
             if _GUID_RE.match(val):
+                if val in have:
+                    continue
                 s = by_id.get(val) or {"id": val, "name": val, "state": "Enabled", "tenant": None}
                 log(f"[scope] trusting explicit subscription id {val}"
                     + (f" (tenant {s.get('tenant')})" if s.get("tenant") else ""))
                 chosen.append(s)
                 have.add(val)
-            elif val not in {s.get("name") for s in subs}:
-                log(f"[scope] '{val}' not found as a subscription id or name", err=True)
+            elif not any(_matches_any([val], n) for n in chosen_names):
+                log(f"[scope] '{val}' matched no subscription id or name", err=True)
 
     # No scope given: REST -> all enabled (home tenant); az -> current subscription.
     if not chosen and not want_scope:
@@ -812,7 +819,7 @@ def build_app_records(args, subs):
     want_arm = getattr(args, "use_arm", False) or bool(args.resource_group)
 
     def graph_matches(raw):
-        return (not args.name_filter) or any(_matches_any(args.name_filter, s.get("name")) for s in raw)
+        return (not args.app_service_name) or any(_matches_any(args.app_service_name, s.get("name")) for s in raw)
 
     if USE_REST:
         # REST tokens are per-subscription (handles cross-tenant guest/Lighthouse),
@@ -842,7 +849,7 @@ def build_app_records(args, subs):
     for site in raw:
         name = site.get("name", "")
         rg = site.get("resourceGroup", "")
-        if args.name_filter and not _matches_any(args.name_filter, name):
+        if args.app_service_name and not _matches_any(args.app_service_name, name):
             continue
         if args.resource_group and rg.lower() != args.resource_group.lower():
             continue
@@ -1287,11 +1294,15 @@ def main():
                    choices=["assess", "deploy", "uninstall"],
                    help="assess (dry run, default) | deploy | uninstall")
     # scope
-    p.add_argument("--subscription", action="append", help="subscription id or name (repeatable)")
-    p.add_argument("--subscription-filter", action="append", help="match subscription name: substring, or glob if it contains */?/[ (repeatable)")
-    p.add_argument("--all-subscriptions", action="store_true", help="assess every enabled subscription")
+    p.add_argument("--subscription", "--subscription-filter", dest="subscription",
+                   action="append", metavar="GUID|NAME",
+                   help="subscription GUID, or name — substring, or glob with */?/[ (repeatable). "
+                        "A GUID not visible to enumeration is trusted. (--subscription-filter is an alias.)")
+    p.add_argument("--all-subscriptions", action="store_true", help="every enabled subscription (cross-tenant via az)")
     p.add_argument("--resource-group", help="limit to a resource group")
-    p.add_argument("--name-filter", action="append", help="match app name: substring, or glob if it contains */?/[ (repeatable)")
+    p.add_argument("--app-service-name", "--name-filter", dest="app_service_name",
+                   action="append", metavar="NAME",
+                   help="app service name — substring, or glob with */?/[ (repeatable). (--name-filter is an alias.)")
     # output
     p.add_argument("--output-file", help="write report to file (.txt/.md/.csv/.json by extension)")
     p.add_argument("--format", choices=["txt", "md", "csv", "json"], help="override output format")

@@ -34,23 +34,25 @@ python3 dt_appservice_fleet.py assess --all-subscriptions
 
 # filter subscriptions by name substring, write a flat file (format by extension)
 python3 dt_appservice_fleet.py assess \
-    --subscription-filter Liftr --output-file reports/liftr.md
+    --subscription Liftr --output-file reports/liftr.md
 
 # one subscription, include per-app startup command + DT state (slower)
 python3 dt_appservice_fleet.py assess \
     --subscription "Sales-Engineering/NORAM" --detailed \
-    --name-filter dtfleet --output-file reports/noram.json
+    --app-service-name dtfleet --output-file reports/noram.json
 ```
 
-Scope flags: `--subscription` (id or name, repeatable), `--subscription-filter`
-(name match, repeatable), `--all-subscriptions`, `--resource-group`,
-`--name-filter` (repeatable). Output: `--output-file` (console if omitted),
+Scope flags: `--subscription GUID|NAME` (a subscription GUID, or a name;
+repeatable), `--all-subscriptions`, `--resource-group`, `--app-service-name`
+(repeatable). Output: `--output-file` (console if omitted),
 `--format txt|md|csv|json`, `--detailed`.
 
-**Wildcards:** `--name-filter` and `--subscription-filter` treat a value containing
-`*`, `?`, or `[` as a case-insensitive glob (anchored to the whole name); a plain
-value stays a substring match. E.g. `--name-filter "dtfleet-node-*"`,
-`--subscription-filter "*-prod"`.
+**Wildcards:** both `--app-service-name` and `--subscription` (name form) treat a
+value containing `*`, `?`, or `[` as a case-insensitive glob (anchored to the whole
+name); a plain value stays a substring match. E.g. `--app-service-name
+"dtfleet-node-*"`, `--subscription "*-prod"`. A `--subscription` value that is a
+GUID matches by id (and is trusted even if cross-tenant). `--subscription-filter`
+and `--name-filter` remain as aliases.
 
 **Speed (`--rest`):** add `--rest` to run inventory + per-app enrich through the
 **ARM REST API** instead of the `az` CLI. See [Performance](#performance-the-az-cli-tax)
@@ -76,7 +78,7 @@ python3 dt_appservice_fleet.py deploy \
     --ntfy-topic the-score-of-the-hms-pinafore-1
 
 # preview without applying
-python3 dt_appservice_fleet.py deploy --name-filter dtfleet --what-if
+python3 dt_appservice_fleet.py deploy --app-service-name dtfleet --what-if
 ```
 
 Useful knobs: `--dt-include` (override the per-runtime tech), `--dt-flavor`
@@ -139,10 +141,10 @@ are *retried* on the next run.
 
 ```bash
 # start a rollout
-python3 dt_appservice_fleet.py deploy --subscription-filter prod --rest \
+python3 dt_appservice_fleet.py deploy --subscription prod --rest \
     --state-file rollout.jsonl --yes
 # ...interrupted (Ctrl-C, token expiry, network)... just run it again:
-python3 dt_appservice_fleet.py deploy --subscription-filter prod --rest \
+python3 dt_appservice_fleet.py deploy --subscription prod --rest \
     --state-file rollout.jsonl --yes      # resumes where it left off
 ```
 
