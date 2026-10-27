@@ -162,10 +162,17 @@ NO_TOKEN_CACHE = False
 ARM = "https://management.azure.com"
 ARM_RESOURCE = "https://management.azure.com/"
 ARM_API = "2023-12-01"
-_arm_token = {"token": None, "exp": 0.0}
+# Tokens are per-tenant: cross-tenant subscriptions each need their own token.
+# Keyed by tenant id ("" = default/home tenant).
+_arm_tokens = {}
 _arm_token_lock = threading.Lock()
-_TOKEN_CACHE_FILE = os.path.join(
-    tempfile.gettempdir(), f"dt-fleet-arm-token-{getattr(os, 'getuid', lambda: 'u')()}.json")
+_TOKEN_DIR = tempfile.gettempdir()
+_TOKEN_UID = getattr(os, "getuid", lambda: "u")()
+
+
+def _token_cache_file(key):
+    k = re.sub(r"[^A-Za-z0-9._-]", "_", key or "default")
+    return os.path.join(_TOKEN_DIR, f"dt-fleet-arm-token-{_TOKEN_UID}-{k}.json")
 
 
 def _token_via_sp():
@@ -201,9 +208,9 @@ def _token_via_imds():
     return d["access_token"], float(d.get("expires_on") or (time.time() + 3000))
 
 
-def _load_disk_token():
+def _load_disk_token(key):
     try:
-        with open(_TOKEN_CACHE_FILE) as f:
+        with open(_token_cache_file(key)) as f:
             d = json.load(f)
         if d.get("exp", 0) - 120 > time.time():
             return d["token"], d["exp"]
@@ -212,41 +219,50 @@ def _load_disk_token():
     return None
 
 
-def _save_disk_token(token, exp):
+def _save_disk_token(key, token, exp):
     try:
-        fd = os.open(_TOKEN_CACHE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(_token_cache_file(key), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump({"token": token, "exp": exp}, f)
     except Exception:  # noqa: BLE001
         pass
 
 
-def invalidate_token():
-    _arm_token["token"] = None
-    _arm_token["exp"] = 0.0
+def invalidate_token(subscription=None):
+    key = subscription or "default"
+    _arm_tokens.pop(key, None)
     try:
-        os.remove(_TOKEN_CACHE_FILE)
+        os.remove(_token_cache_file(key))
     except OSError:
         pass
 
 
-def arm_token():
-    """Acquire an ARM bearer token, cheapest source first. Thread-safe.
+def arm_token(subscription=None):
+    """Acquire an ARM bearer token valid for `subscription` (None = home/default),
+    cheapest source first. Thread-safe and keyed by SUBSCRIPTION.
 
-    Order: in-memory cache -> disk cache -> service principal (env) -> managed
-    identity (IMDS) -> `az account get-access-token` (slow fallback). The fast
-    sources and the disk cache mean repeat runs pay ZERO az cost.
+    Keying by subscription (not tenant) is deliberate: `az account get-access-token
+    --subscription <id>` lets az resolve the correct token — including cross-tenant
+    GUEST / Azure Lighthouse access, where the subscription's home tenant differs
+    from the one you're signed into. An SP or managed identity is a single identity
+    whose token works across every subscription it can reach.
+
+    Order: in-memory -> disk cache -> service principal (env) -> managed identity
+    (IMDS) -> `az account get-access-token [--subscription <id>]`.
     """
+    key = subscription or "default"
     with _arm_token_lock:
         now = time.time()
-        if _arm_token["token"] and _arm_token["exp"] - 120 > now:
-            return _arm_token["token"]
+        cur = _arm_tokens.get(key)
+        if cur and cur["exp"] - 120 > now:
+            return cur["token"]
         if not NO_TOKEN_CACHE:
-            disk = _load_disk_token()
+            disk = _load_disk_token(key)
             if disk:
-                _arm_token["token"], _arm_token["exp"] = disk
-                vlog(f"ARM token: disk cache ({int((disk[1]-now)/60)}m left)")
-                return _arm_token["token"]
+                _arm_tokens[key] = {"token": disk[0], "exp": disk[1]}
+                vlog(f"ARM token[{key}]: disk cache ({int((disk[1]-now)/60)}m left)")
+                return disk[0]
+        # SP / IMDS: one identity, token works across all accessible subscriptions.
         for label, fn in (("service-principal", _token_via_sp),
                           ("managed-identity", _token_via_imds)):
             try:
@@ -254,27 +270,33 @@ def arm_token():
             except Exception:  # noqa: BLE001
                 got = None
             if got:
-                _arm_token["token"], _arm_token["exp"] = got
+                _arm_tokens[key] = {"token": got[0], "exp": got[1]}
                 log(f"[auth] ARM token via {label} (no az)")
                 if not NO_TOKEN_CACHE:
-                    _save_disk_token(*got)
-                return _arm_token["token"]
-        # Slow fallback: the az CLI.
-        log("[auth] ARM token via az CLI (slow — cached for reuse; "
-            "set AZURE_CLIENT_ID/SECRET/TENANT_ID or run on a managed identity to skip)")
-        data = run_az(["account", "get-access-token", "-o", "json"], check=True, timeout=180)
-        _arm_token["token"] = data["accessToken"]
+                    _save_disk_token(key, *got)
+                return got[0]
+        # Delegated: let az mint a token scoped to the subscription (handles the
+        # right tenant automatically, incl. guest/Lighthouse).
+        az_args = ["account", "get-access-token", "-o", "json"]
+        if subscription:
+            az_args += ["--subscription", subscription]
+        log(f"[auth] ARM token[{key}] via az CLI"
+            + (" (set AZURE_CLIENT_ID/SECRET/TENANT_ID or use a managed identity to skip)"
+               if key == "default" else ""))
+        data = run_az(az_args, check=True, timeout=180)
+        tok = data["accessToken"]
         try:
-            _arm_token["exp"] = float(data.get("expires_on") or 0) or (now + 3000)
+            exp = float(data.get("expires_on") or 0) or (now + 3000)
         except (TypeError, ValueError):
-            _arm_token["exp"] = now + 3000
+            exp = now + 3000
+        _arm_tokens[key] = {"token": tok, "exp": exp}
         if not NO_TOKEN_CACHE:
-            _save_disk_token(_arm_token["token"], _arm_token["exp"])
-        return _arm_token["token"]
+            _save_disk_token(key, tok, exp)
+        return tok
 
 
-def _arm_call(method, url, body=None, timeout=60, _retry=True):
-    headers = {"Authorization": f"Bearer {arm_token()}"}
+def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True):
+    headers = {"Authorization": f"Bearer {arm_token(subscription)}"}
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -292,12 +314,12 @@ def _arm_call(method, url, body=None, timeout=60, _retry=True):
         return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         # A cached token may be expired or for the wrong tenant -> 401. Invalidate
-        # and retry once with a freshly minted token.
+        # that tenant's token and retry once with a freshly minted one.
         if e.code == 401 and _retry:
             if VERBOSE:
-                vlog("ARM 401 — invalidating cached token and retrying")
-            invalidate_token()
-            return _arm_call(method, url, body, timeout, _retry=False)
+                vlog(f"ARM 401 — invalidating token[{subscription or 'default'}] and retrying")
+            invalidate_token(subscription)
+            return _arm_call(method, url, body, timeout, subscription, _retry=False)
         body_txt = ""
         try:
             body_txt = e.read()[:200].decode("utf-8", "ignore")
@@ -312,22 +334,52 @@ def _arm_call(method, url, body=None, timeout=60, _retry=True):
         return None
 
 
-def arm_resource(method, resource_id, sub_path="", body=None, timeout=60):
-    return _arm_call(method, f"{ARM}{resource_id}{sub_path}?api-version={ARM_API}", body, timeout)
+def arm_resource(method, resource_id, sub_path="", body=None, timeout=60, subscription=None):
+    return _arm_call(method, f"{ARM}{resource_id}{sub_path}?api-version={ARM_API}",
+                     body, timeout, subscription)
 
 
-def arm_graph(kql, subscription_ids):
+def arm_graph(kql, subscription_ids, subscription=None):
     url = f"{ARM}/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"
     rows, skip = [], 0
     while True:
         body = {"subscriptions": subscription_ids, "query": kql,
                 "options": {"resultFormat": "objectArray", "$top": 1000, "$skip": skip}}
-        out = _arm_call("POST", url, body)
+        out = _arm_call("POST", url, body, subscription=subscription)
         batch = (out or {}).get("data", []) if isinstance(out, dict) else []
         rows.extend(batch)
         if len(batch) < 1000:
             break
         skip += len(batch)
+    return rows
+
+
+def _rg_from_id(resource_id):
+    m = re.search(r"/resourceGroups/([^/]+)/", resource_id or "", re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def arm_webapp_list(subscription_ids, resource_group=None):
+    """List web sites via ARM REST (fast; the --rest fallback for Graph indexing lag).
+    Each subscription's call uses a token scoped to that subscription."""
+    rows = []
+    for sid in subscription_ids:
+        if resource_group:
+            url = (f"{ARM}/subscriptions/{sid}/resourceGroups/{resource_group}"
+                   f"/providers/Microsoft.Web/sites?api-version={ARM_API}")
+        else:
+            url = f"{ARM}/subscriptions/{sid}/providers/Microsoft.Web/sites?api-version={ARM_API}"
+        out = _arm_call("GET", url, subscription=sid)
+        for v in (out or {}).get("value", []) if isinstance(out, dict) else []:
+            props = v.get("properties", {}) or {}
+            sc = props.get("siteConfig", {}) or {}
+            rows.append({
+                "name": v.get("name", ""), "kind": v.get("kind", ""),
+                "resourceGroup": props.get("resourceGroup") or _rg_from_id(v.get("id", "")),
+                "subscriptionId": sid, "location": v.get("location", ""),
+                "state": props.get("state", ""),
+                "linuxFx": sc.get("linuxFxVersion"), "windowsFx": sc.get("windowsFxVersion"),
+            })
     return rows
 
 
@@ -337,30 +389,36 @@ def arm_graph(kql, subscription_ids):
 # Each raises on failure so deploy_one/uninstall_one's try/except reports an error.
 
 def arm_set_appsettings(app, new_settings):
-    cur = arm_resource("POST", app["id"], "/config/appsettings/list")
+    s = app.get("subscription_id")
+    cur = arm_resource("POST", app["id"], "/config/appsettings/list", subscription=s)
     existing = dict(cur.get("properties", {})) if isinstance(cur, dict) else {}
     existing.update(new_settings)
-    if arm_resource("PUT", app["id"], "/config/appsettings", body={"properties": existing}) is None:
+    if arm_resource("PUT", app["id"], "/config/appsettings",
+                    body={"properties": existing}, subscription=s) is None:
         raise RuntimeError("ARM appsettings PUT failed")
 
 
 def arm_delete_appsettings(app, keys):
-    cur = arm_resource("POST", app["id"], "/config/appsettings/list")
+    s = app.get("subscription_id")
+    cur = arm_resource("POST", app["id"], "/config/appsettings/list", subscription=s)
     existing = dict(cur.get("properties", {})) if isinstance(cur, dict) else {}
     for k in keys:
         existing.pop(k, None)
-    if arm_resource("PUT", app["id"], "/config/appsettings", body={"properties": existing}) is None:
+    if arm_resource("PUT", app["id"], "/config/appsettings",
+                    body={"properties": existing}, subscription=s) is None:
         raise RuntimeError("ARM appsettings PUT (delete) failed")
 
 
 def arm_set_startup(app, cmd):
     if arm_resource("PATCH", app["id"], "/config/web",
-                    body={"properties": {"appCommandLine": cmd}}) is None:
+                    body={"properties": {"appCommandLine": cmd}},
+                    subscription=app.get("subscription_id")) is None:
         raise RuntimeError("ARM config/web PATCH failed")
 
 
 def arm_restart(app):
-    if _arm_call("POST", f"{ARM}{app['id']}/restart?api-version={ARM_API}") is None:
+    if _arm_call("POST", f"{ARM}{app['id']}/restart?api-version={ARM_API}",
+                 subscription=app.get("subscription_id")) is None:
         raise RuntimeError("ARM restart failed")
 
 
@@ -529,8 +587,9 @@ def classify(site):
 
 # ----------------------------------------------------------------------------- inventory
 
-def graph_inventory(subscription_ids):
-    """Bulk-fetch all web sites across the given subscriptions via Resource Graph."""
+def graph_inventory(subscription_ids, subscription=None):
+    """Bulk-fetch all web sites across the given subscriptions via Resource Graph.
+    Under --rest, pass `subscription` so the token is scoped correctly."""
     kql = (
         "resources "
         "| where type =~ 'microsoft.web/sites' "
@@ -543,7 +602,7 @@ def graph_inventory(subscription_ids):
     log(f"[inventory] querying Resource Graph across {len(subscription_ids)} subscription(s)"
         + (" via ARM REST" if USE_REST else "") + "...")
     if USE_REST:
-        rows = arm_graph(kql, subscription_ids)
+        rows = arm_graph(kql, subscription_ids, subscription=subscription)
         log(f"[inventory] Resource Graph returned {len(rows)} site(s)")
         return rows
     rows, skip = [], 0
@@ -608,12 +667,13 @@ def _enrich_startup(app):
 
     if USE_REST:
         # ARM REST: ~30x faster than az here (no per-call CLI module load).
-        cfg = arm_resource("GET", app["id"], "/config/web")
+        s = app.get("subscription_id")
+        cfg = arm_resource("GET", app["id"], "/config/web", subscription=s)
         cfg_ok = isinstance(cfg, dict) and "properties" in cfg
         startup = (cfg["properties"].get("appCommandLine") or "") if cfg_ok else ""
         app["startup_command"] = startup if cfg_ok else None
 
-        setres = arm_resource("POST", app["id"], "/config/appsettings/list")
+        setres = arm_resource("POST", app["id"], "/config/appsettings/list", subscription=s)
         settings_ok = isinstance(setres, dict) and "properties" in setres
         names = dict(setres["properties"]) if settings_ok else {}
         app["app_settings"] = names
@@ -655,18 +715,30 @@ def _enrich_startup(app):
 
 # ----------------------------------------------------------------------------- scope
 
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def list_subscriptions_rest():
+    """Subscriptions via ARM REST — ONLY the token's home tenant (single-tenant)."""
+    out = _arm_call("GET", f"{ARM}/subscriptions?api-version=2020-01-01")
+    vals = (out or {}).get("value", []) if isinstance(out, dict) else []
+    return [{"id": v.get("subscriptionId", ""), "name": v.get("displayName", ""),
+             "state": v.get("state", ""), "tenant": v.get("tenantId", "")} for v in vals]
+
+
+def list_subscriptions_az():
+    """Subscriptions via `az account list --all` — CROSS-tenant (all logged-in tenants)."""
+    subs = run_az(["account", "list", "--all", "-o", "json"], check=False) or []
+    return [{"id": s.get("id", ""), "name": s.get("name", ""),
+             "state": s.get("state", ""), "tenant": s.get("tenantId", "")} for s in subs]
+
+
 def list_subscriptions():
-    """Normalized [{id,name,state}] via ARM REST (--rest) or az."""
-    if USE_REST:
-        out = _arm_call("GET", f"{ARM}/subscriptions?api-version=2020-01-01")
-        vals = (out or {}).get("value", []) if isinstance(out, dict) else []
-        return [{"id": v.get("subscriptionId", ""), "name": v.get("displayName", ""),
-                 "state": v.get("state", "")} for v in vals]
-    return run_az(["account", "list", "-o", "json"]) or []
+    return list_subscriptions_rest() if USE_REST else list_subscriptions_az()
 
 
-def resolve_subscriptions(args):
-    subs = list_subscriptions()
+def _pick_subs(subs, args):
     chosen = []
     for s in subs:
         if s.get("state") != "Enabled":
@@ -678,33 +750,94 @@ def resolve_subscriptions(args):
             chosen.append(s)
         elif args.subscription_filter and _matches_any(args.subscription_filter, name):
             chosen.append(s)
-    if not chosen and not (args.subscription or args.subscription_filter or args.all_subscriptions):
-        # No scope given. On the REST path there is no "current subscription"
-        # concept, so default to all enabled; otherwise use az's current sub.
+    return chosen
+
+
+def resolve_subscriptions(args):
+    subs = list_subscriptions()
+    chosen = _pick_subs(subs, args)
+    want_scope = bool(args.subscription or args.subscription_filter or args.all_subscriptions)
+
+    # ARM REST /subscriptions is SINGLE-tenant (the token's home tenant). If a scope
+    # was requested but didn't fully resolve, enumerate across tenants via az and
+    # retry — this is how --subscription-filter / cross-tenant ids get found.
+    unmatched_ids = ([v for v in (args.subscription or [])
+                      if _GUID_RE.match(v) and v not in {s["id"] for s in chosen}])
+    if USE_REST and (args.all_subscriptions or unmatched_ids or (want_scope and not chosen)):
+        az_subs = list_subscriptions_az()
+        if az_subs:
+            known = {s["id"] for s in subs}
+            if any(s["id"] not in known for s in az_subs):
+                log(f"[scope] REST list is single-tenant; az enumerates "
+                    f"{len(az_subs)} subscription(s) across tenants — matching against those")
+            merged = {s["id"]: s for s in subs}
+            for s in az_subs:
+                merged.setdefault(s["id"], s)
+            subs = list(merged.values())
+            chosen = _pick_subs(subs, args)
+
+    # Trust explicit subscription IDs even if still not enumerated (e.g. a tenant
+    # az isn't logged into) — we mint that tenant's token on demand.
+    if args.subscription:
+        by_id = {s.get("id"): s for s in subs}
+        have = {s.get("id") for s in chosen}
+        for val in args.subscription:
+            if val in have:
+                continue
+            if _GUID_RE.match(val):
+                s = by_id.get(val) or {"id": val, "name": val, "state": "Enabled", "tenant": None}
+                log(f"[scope] trusting explicit subscription id {val}"
+                    + (f" (tenant {s.get('tenant')})" if s.get("tenant") else ""))
+                chosen.append(s)
+                have.add(val)
+            elif val not in {s.get("name") for s in subs}:
+                log(f"[scope] '{val}' not found as a subscription id or name", err=True)
+
+    # No scope given: REST -> all enabled (home tenant); az -> current subscription.
+    if not chosen and not want_scope:
         if USE_REST:
             chosen = [s for s in subs if s.get("state") == "Enabled"]
         else:
             cur = run_az(["account", "show", "-o", "json"])
-            chosen = [cur] if cur else []
+            if cur:
+                chosen = [{"id": cur.get("id", ""), "name": cur.get("name", ""),
+                           "state": cur.get("state", ""), "tenant": cur.get("tenantId", "")}]
     return chosen
 
 
 def build_app_records(args, subs):
     sub_ids = [s["id"] for s in subs]
-    sub_name = {s["id"]: s["name"] for s in subs}
-    if getattr(args, "use_arm", False) or args.resource_group:
-        # ARM path: immediate visibility (no Graph lag), good for RG-scoped runs.
-        raw = arm_inventory(sub_ids, args.resource_group)
+    sub_name = {s["id"]: s.get("name", s["id"]) for s in subs}
+    sub_tenant = {s["id"]: s.get("tenant") for s in subs}
+    want_arm = getattr(args, "use_arm", False) or bool(args.resource_group)
+
+    def graph_matches(raw):
+        return (not args.name_filter) or any(_matches_any(args.name_filter, s.get("name")) for s in raw)
+
+    if USE_REST:
+        # REST tokens are per-subscription (handles cross-tenant guest/Lighthouse),
+        # so inventory each subscription with its own token.
+        raw = []
+        if want_arm:
+            raw = arm_webapp_list(sub_ids, resource_group=args.resource_group)
+        else:
+            for sid in sub_ids:
+                raw += graph_inventory([sid], subscription=sid)
+            if not graph_matches(raw):
+                log("[inventory] Graph returned no name-filter matches; "
+                    "falling back to ARM REST site list (handles indexing lag)...")
+                raw = arm_webapp_list(sub_ids)
     else:
-        raw = graph_inventory(sub_ids)
-        # Resource Graph lags for freshly-created resources: if a name filter is
-        # set and Graph returns nothing matching, fall back to ARM.
-        if args.name_filter:
-            matched = [s for s in raw if _matches_any(args.name_filter, s.get("name"))]
-            if not matched:
+        # az path handles cross-tenant natively.
+        if want_arm:
+            raw = arm_inventory(sub_ids, args.resource_group)
+        else:
+            raw = graph_inventory(sub_ids)
+            if not graph_matches(raw):
                 log("[inventory] Graph returned no name-filter matches; "
                     "falling back to ARM (handles indexing lag)...")
                 raw = arm_inventory(sub_ids)
+
     records = []
     for site in raw:
         name = site.get("name", "")
@@ -720,6 +853,7 @@ def build_app_records(args, subs):
             "resource_group": rg,
             "subscription_id": sid,
             "subscription_name": sub_name.get(sid, sid),
+            "tenant": sub_tenant.get(sid),
             "location": site.get("location", ""),
             "state": site.get("state", ""),
             "id": f"/subscriptions/{sid}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{name}",
@@ -1224,6 +1358,8 @@ def main():
     # --- mutating modes ---
     # Candidate set from classification only (no enrich needed yet): Linux code apps.
     candidates = [r for r in records if (r["deploy_model"] == "code" and r["is_linux"])]
+    n_class = len(candidates)                 # Linux-code apps found in scope
+    state_removed = 0
 
     # Resumability: a prior run's checkpoint lets us skip finished apps BEFORE the
     # (potentially large) enrich, so an interrupted rollout resumes cheaply.
@@ -1233,6 +1369,7 @@ def main():
         done_ok = {i for i, s in done.items() if s in done_terminal}
         before = len(candidates)
         candidates = [r for r in candidates if r["id"] not in done_ok]
+        state_removed = before - len(candidates)
         log(f"[resume] state file '{args.state_file}': {len(done_ok)} already done, "
             f"{len(candidates)}/{before} remaining (errors/unknowns are retried)")
 
@@ -1268,8 +1405,17 @@ def main():
         log(f"    (skip) {r['name']}: {why}")
 
     if not actionable:
-        raise SystemExit(f"no apps to {args.mode}"
-                         + (" (all remaining done per state file)" if args.state_file else ""))
+        if n_class == 0:
+            reason = (f"no Linux code App Services matched the scope "
+                      f"({len(records)} app(s) in scope, none are Linux-code/deployable)")
+        elif state_removed and not candidates:
+            reason = f"all {state_removed} remaining app(s) already completed per state file"
+        elif args.mode == "deploy":
+            reason = ("nothing actionable — candidates are already instrumented "
+                      "(use --force) or their state is unknown (re-run)")
+        else:
+            reason = "no instrumented apps found to uninstall"
+        raise SystemExit(f"no apps to {args.mode} — {reason}")
 
     if not args.yes and not args.what_if:
         resp = input(f"\nProceed to {args.mode} {len(actionable)} app(s)? [y/N] ").strip().lower()
