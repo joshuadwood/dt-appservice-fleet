@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to creds.json and fill in. creds.json is gitignored. The tool reads credentials.dtApiEnvUrl + credentials.dtPaasToken.",
+  "credentials": {
+    "dtTenantId": "<env-id, e.g. abc12345>",
+    "dtApiEnvUrl": "https://<env-id>.live.dynatrace.com",
+    "dtPaasToken": "dt0c01.<PaaS token with InstallerDownload scope>"
+  }
+}

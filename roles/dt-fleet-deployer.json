@@ -1,0 +1,21 @@
+{
+  "Name": "DT Fleet Deployer",
+  "IsCustom": true,
+  "Description": "Least-privilege role for `dt_appservice_fleet.py deploy`/`uninstall`. Adds exactly the writes the tool performs: set app settings, set the startup command (site config), and restart. Does NOT grant create/delete of sites, scaling, networking, slots, publish credentials, or any other management action. Assign to the delegated user who runs deployments — no Service Principal or admin account required. Prefer scoping AssignableScopes/assignment to the target resource group(s) rather than the whole subscription.",
+  "Actions": [
+    "Microsoft.Web/sites/read",
+    "Microsoft.Web/sites/config/read",
+    "Microsoft.Web/sites/config/list/action",
+    "Microsoft.Web/sites/config/write",
+    "Microsoft.Web/sites/restart/action",
+    "Microsoft.Resources/subscriptions/read",
+    "Microsoft.Resources/subscriptions/resourceGroups/read",
+    "Microsoft.ResourceGraph/resources/read"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/REPLACE_WITH_SUBSCRIPTION_ID"
+  ]
+}

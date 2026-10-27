@@ -1,0 +1,29 @@
+# Secrets — NEVER commit
+creds.json
+*.pem
+*.key
+.env
+
+# Generated assessment reports (contain real tenant app inventory)
+reports/
+
+# Resumable-rollout checkpoints / local state
+*.state.jsonl
+rollout*.jsonl
+
+# ARM token disk cache (if ever placed here)
+dt-fleet-arm-token-*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (demo apps, if deps get installed locally)
+node_modules/
+
+# Build artifacts / scratch
+*.zip
+*.log
+.DS_Store
