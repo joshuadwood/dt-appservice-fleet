@@ -41,6 +41,21 @@ python3 dt_appservice_fleet.py deploy \
 Interrupted? Re-run the **exact same command** — it skips the apps already done
 (`--state-file`) and continues.
 
+## 3b. Verify it actually instrumented
+
+`deploy` success means *config applied + restarts triggered* — not that the agent
+loaded (with `--resilient` fail-open, a failed download still "succeeds"). Confirm
+from the container log:
+
+```bash
+python3 dt_appservice_fleet.py verify \
+    --subscription prod --app-service-name "web-*" --rest -v
+```
+Per-app verdict: **INSTRUMENTED (connected)** ✅ · **FAIL-OPEN — NOT instrumented**
+(agent download failed — check the PaaS token/endpoint for that tenant) · **injected
+but INACTIVATED** (tenant disabled the process group) · **no agent markers** (idle /
+cold — hit the app URL to wake it, then re-verify).
+
 ## 4. Uninstall (revert)
 
 ```bash

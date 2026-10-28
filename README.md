@@ -15,7 +15,7 @@ Credentials (`dtApiEnvUrl`, `dtPaasToken`) are read from `creds.json`.
 
 | File | Purpose |
 |---|---|
-| `dt_appservice_fleet.py` | **Main tool.** `assess` (dry run) / `deploy` / `uninstall` across subscriptions. |
+| `dt_appservice_fleet.py` | **Main tool.** `assess` (dry run) / `deploy` / `verify` / `uninstall` across subscriptions. |
 | `provision_demo_apps.sh` | Stand up 4 demo App Services (2 Python, 2 Node — distinct frameworks). |
 | `generate_load.py` | Drive CRUD traffic against the apps so OneAgent has requests to trace. |
 | `apps/` | Source for the 4 demo apps (Express, Fastify, Flask, FastAPI). |

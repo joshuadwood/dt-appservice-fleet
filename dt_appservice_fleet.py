@@ -1318,6 +1318,81 @@ def uninstall_one(app, args):
     return result
 
 
+# ----------------------------------------------------------------------------- verify
+
+def kudu_get(app, vfs_path):
+    """GET a Kudu/SCM VFS path using the ARM bearer token (no basic auth needed)."""
+    url = f"https://{app['name']}.scm.azurewebsites.net/api/vfs/{vfs_path}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {arm_token(app.get('subscription_id'))}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read().decode("utf-8", "ignore")
+    except Exception as e:  # noqa: BLE001
+        if VERBOSE:
+            vlog(f"kudu GET {vfs_path} failed: {redact(str(e))}")
+        return None
+
+
+def verify_one(app):
+    """Confirm (from the container log) whether the OneAgent actually loaded —
+    distinct from 'deploy succeeded'. Reads the newest container docker log via
+    Kudu and classifies the wrapper + agent markers."""
+    name = app["name"]
+    res = {"name": name, "rg": app["resource_group"], "verdict": "", "detail": ""}
+    listing = kudu_get(app, "LogFiles/")
+    if listing is None:
+        res["verdict"] = "unreachable"
+        res["detail"] = "could not read container logs via SCM (Linux app? access? basic-auth/network?)"
+        return res
+    try:
+        files = [f.get("name", "") for f in json.loads(listing) if isinstance(f, dict)]
+    except Exception:  # noqa: BLE001
+        files = []
+    docker = sorted(f for f in files if f.endswith("default_docker.log"))
+    if not docker:
+        res["verdict"] = "no-log"
+        res["detail"] = "no *_default_docker.log yet (enable App Service logging, or no recent boot)"
+        return res
+    # Boot markers (install/LD_PRELOAD) rotate out of the current file, so read the
+    # newest few logs together; the agent's live "Connected to ..." lines are enough
+    # on their own to prove instrumentation.
+    chunks = [c for c in (kudu_get(app, f"LogFiles/{fn}") for fn in docker[-3:]) if c]
+    t = "\n".join(chunks).lower()
+    if not t:
+        res["verdict"] = "unreachable"
+        res["detail"] = "container log fetched empty"
+        return res
+
+    fail_open = "[dt-fleet] warning: oneagent unavailable" in t
+    boot = ("[dt-fleet] oneagent:" in t) or ("liboneagentproc" in t) or ("unpacking to" in t)
+    connected = ("/communication" in t and "dynatrace.com" in t) or "connected to https://" in t
+    inactivated = ("agent inactivated" in t) or ("active state to off" in t)
+    launched = any(s in t for s in ("listening on", "server running", "application startup complete",
+                                    "started server process", "booting worker", "serving"))
+
+    if not (connected or boot) and fail_open:
+        res["verdict"] = "FAIL-OPEN — NOT instrumented"
+        res["detail"] = ("wrapper could not obtain the agent; app started WITHOUT it. "
+                         "Check DT_API_TOKEN scope + DT_ENDPOINT for this tenant, and egress to it.")
+    elif inactivated:
+        res["verdict"] = "injected but AGENT INACTIVATED"
+        res["detail"] = ("agent loaded but the tenant disabled this process group "
+                         "(monitored technologies / PG rule — see gotchas section 6)")
+    elif connected:
+        res["verdict"] = "INSTRUMENTED (connected)"
+        res["detail"] = ("agent loaded + connected to Dynatrace"
+                         + ("; app launched" if launched else "")
+                         + ("; install confirmed" if boot else ""))
+    elif boot:
+        res["verdict"] = "injected, connection unconfirmed"
+        res["detail"] = "agent loaded; no 'Connected to ...' line yet (cold-starting, or egress blocked)"
+    else:
+        res["verdict"] = "no agent markers"
+        res["detail"] = "no OneAgent lines in recent logs (cold-starting? logging off? not instrumented?)"
+    return res
+
+
 # ----------------------------------------------------------------------------- ntfy
 
 def notify(topic, title, message, tags="information_source"):
@@ -1339,8 +1414,8 @@ def notify(topic, title, message, tags="information_source"):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", nargs="?", default="assess",
-                   choices=["assess", "deploy", "uninstall"],
-                   help="assess (dry run, default) | deploy | uninstall")
+                   choices=["assess", "deploy", "uninstall", "verify"],
+                   help="assess (dry run, default) | deploy | uninstall | verify (confirm injection from container logs)")
     # scope
     p.add_argument("--subscription", "--subscription-filter", dest="subscription",
                    action="append", metavar="GUID|NAME",
@@ -1417,6 +1492,22 @@ def main():
         if args.ntfy_topic:
             notify(args.ntfy_topic, "DT Fleet — assessment complete",
                    f"{len(records)} app services assessed across {len(subs)} subscription(s).")
+        return
+
+    if args.mode == "verify":
+        if not records:
+            raise SystemExit("no apps matched the scope to verify")
+        log(f"[verify] reading container logs for {len(records)} app(s)...")
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for r in ex.map(verify_one, records):
+                results.append(r)
+                log(f"    {r['verdict']:30}  {r['name']}: {r['detail']}")
+        ok = sum(1 for r in results if r["verdict"].startswith("INSTRUMENTED"))
+        bad = [r for r in results if "NOT instrumented" in r["verdict"] or "INACTIVATED" in r["verdict"]]
+        log(f"\n[verify] {ok}/{len(results)} confirmed instrumented + connected")
+        for r in bad:
+            log(f"    !! {r['name']}: {r['verdict']}", err=True)
         return
 
     # --- mutating modes ---
