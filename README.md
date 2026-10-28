@@ -169,10 +169,21 @@ only the minimum RBAC needed. No Service Principal secret and no highly-privileg
 
 **Token source, cheapest first** (`arm_token()`): disk cache → service principal
 *(optional,* `AZURE_*` *env)* → managed identity (IMDS) → `az` (your delegated login).
-The default path is your `az` login, so nothing is stored but a short-lived,
-user-scoped token (0600 temp cache; `--no-token-cache` to disable). A long rollout
-that outlives the token simply fails cleanly — re-`az login` and re-run with the
-same `--state-file` to resume.
+Force one with `--auth {auto,az,managed-identity,service-principal}`. Nothing is
+stored but a short-lived, identity-scoped token (0600 temp cache;
+`--no-token-cache` to disable). A long rollout that outlives the token fails
+cleanly — re-auth and re-run with the same `--state-file` to resume.
+
+> **Single-identity vs. delegated.** A **managed identity** or **service principal**
+> is *one* identity: its token only reaches subscriptions it was explicitly granted,
+> and it **cannot** be swapped per tenant. So under `--auth managed-identity`/`-sp`
+> the tool enumerates and operates **only** on that identity's subscriptions — it
+> will not pull in cross-tenant subscriptions from `az` (which is a *different*
+> identity; mixing them produces `InvalidAuthenticationTokenTenant` 401s). If your
+> `--subscription` scope matches none of the identity's subscriptions, the tool
+> lists what it *can* reach and tells you to grant access or use `--auth az`.
+> **Delegated `az`** (a user logged into multiple tenants) *does* resolve
+> cross-tenant subscriptions, per-subscription, incl. guest / Azure Lighthouse.
 
 **Minimum RBAC** — two custom roles are provided in [`roles/`](roles/), scoped to the
 *exact* actions the tool calls (nothing else — no site create/delete, scaling,

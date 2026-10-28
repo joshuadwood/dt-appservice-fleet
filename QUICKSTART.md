@@ -58,6 +58,7 @@ python3 dt_appservice_fleet.py uninstall \
 | `--app-service-name` / `--resource-group` | narrow to specific apps (name: substring or glob) |
 | `--what-if` | show what *would* happen, change nothing |
 | `--rest` | use ARM REST instead of `az` — **~30× faster when `az` is slow** |
+| `--auth az\|managed-identity\|service-principal` | force the token source (default auto). MI/SP reach only their own subscriptions; `az` resolves cross-tenant. |
 | `--resilient` | persist agent to `/home` (no re-download on restart) + fail-open |
 | `--state-file FILE` | resumable rollout — completed apps skipped on re-run |
 | `--force` | re-apply to already-instrumented apps (default skips them) |

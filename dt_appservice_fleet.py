@@ -159,11 +159,14 @@ def run_az(args, *, check=True, timeout=180):
 
 USE_REST = False
 NO_TOKEN_CACHE = False
+AUTH_PREF = "auto"          # auto | az | managed-identity | service-principal (--auth)
+AUTH_MODE = None            # resolved source once a token is minted
 ARM = "https://management.azure.com"
 ARM_RESOURCE = "https://management.azure.com/"
 ARM_API = "2023-12-01"
-# Tokens are per-tenant: cross-tenant subscriptions each need their own token.
-# Keyed by tenant id ("" = default/home tenant).
+# Delegated (az) tokens are keyed by subscription so az resolves the right tenant
+# (incl. guest/Lighthouse). A managed identity / service principal is a SINGLE
+# identity: one token for every subscription it can reach, cached under "default".
 _arm_tokens = {}
 _arm_token_lock = threading.Lock()
 _TOKEN_DIR = tempfile.gettempdir()
@@ -237,22 +240,26 @@ def invalidate_token(subscription=None):
         pass
 
 
+def auth_is_single_identity():
+    """True once the resolved token source is a managed identity or service
+    principal — a single identity whose token cannot be swapped per tenant."""
+    return AUTH_MODE in ("managed-identity", "service-principal")
+
+
 def arm_token(subscription=None):
-    """Acquire an ARM bearer token valid for `subscription` (None = home/default),
-    cheapest source first. Thread-safe and keyed by SUBSCRIPTION.
+    """Acquire an ARM bearer token, respecting --auth. Thread-safe.
 
-    Keying by subscription (not tenant) is deliberate: `az account get-access-token
-    --subscription <id>` lets az resolve the correct token — including cross-tenant
-    GUEST / Azure Lighthouse access, where the subscription's home tenant differs
-    from the one you're signed into. An SP or managed identity is a single identity
-    whose token works across every subscription it can reach.
-
-    Order: in-memory -> disk cache -> service principal (env) -> managed identity
-    (IMDS) -> `az account get-access-token [--subscription <id>]`.
+    - Managed identity / service principal = ONE identity: a single token is used
+      for every subscription it can reach (cached under "default"). It CANNOT be
+      re-minted per tenant, so subscriptions outside its reach simply fail.
+    - Delegated az = tokens keyed by subscription (`az account get-access-token
+      --subscription <id>` resolves the right tenant, incl. guest/Lighthouse).
     """
-    key = subscription or "default"
+    global AUTH_MODE
     with _arm_token_lock:
         now = time.time()
+        single = auth_is_single_identity()
+        key = "default" if single else (subscription or "default")
         cur = _arm_tokens.get(key)
         if cur and cur["exp"] - 120 > now:
             return cur["token"]
@@ -262,36 +269,45 @@ def arm_token(subscription=None):
                 _arm_tokens[key] = {"token": disk[0], "exp": disk[1]}
                 vlog(f"ARM token[{key}]: disk cache ({int((disk[1]-now)/60)}m left)")
                 return disk[0]
-        # SP / IMDS: one identity, token works across all accessible subscriptions.
-        for label, fn in (("service-principal", _token_via_sp),
-                          ("managed-identity", _token_via_imds)):
+        # SP / managed identity (single identity). Respect --auth.
+        sources = []
+        if AUTH_PREF in ("auto", "service-principal"):
+            sources.append(("service-principal", _token_via_sp))
+        if AUTH_PREF in ("auto", "managed-identity"):
+            sources.append(("managed-identity", _token_via_imds))
+        for label, fn in sources:
             try:
                 got = fn()
             except Exception:  # noqa: BLE001
                 got = None
             if got:
-                _arm_tokens[key] = {"token": got[0], "exp": got[1]}
-                log(f"[auth] ARM token via {label} (no az)")
+                if AUTH_MODE != label:
+                    log(f"[auth] ARM token via {label} — single identity "
+                        f"(only its accessible subscriptions are reachable)")
+                AUTH_MODE = label
+                _arm_tokens["default"] = {"token": got[0], "exp": got[1]}
                 if not NO_TOKEN_CACHE:
-                    _save_disk_token(key, *got)
+                    _save_disk_token("default", *got)
                 return got[0]
-        # Delegated: let az mint a token scoped to the subscription (handles the
-        # right tenant automatically, incl. guest/Lighthouse).
+        # Delegated az (per-subscription so az resolves the right tenant).
+        if AUTH_PREF not in ("auto", "az"):
+            raise RuntimeError(f"--auth {AUTH_PREF}: no token available from that source")
+        AUTH_MODE = "az"
         az_args = ["account", "get-access-token", "-o", "json"]
         if subscription:
             az_args += ["--subscription", subscription]
-        log(f"[auth] ARM token[{key}] via az CLI"
+        log(f"[auth] ARM token[{subscription or 'default'}] via az CLI"
             + (" (set AZURE_CLIENT_ID/SECRET/TENANT_ID or use a managed identity to skip)"
-               if key == "default" else ""))
+               if not subscription else ""))
         data = run_az(az_args, check=True, timeout=180)
         tok = data["accessToken"]
         try:
             exp = float(data.get("expires_on") or 0) or (now + 3000)
         except (TypeError, ValueError):
             exp = now + 3000
-        _arm_tokens[key] = {"token": tok, "exp": exp}
+        _arm_tokens[subscription or "default"] = {"token": tok, "exp": exp}
         if not NO_TOKEN_CACHE:
-            _save_disk_token(key, tok, exp)
+            _save_disk_token(subscription or "default", tok, exp)
         return tok
 
 
@@ -313,18 +329,24 @@ def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True
         # Empty 200 (e.g. restart) -> {} (success); errors below -> None.
         return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
-        # A cached token may be expired or for the wrong tenant -> 401. Invalidate
-        # that tenant's token and retry once with a freshly minted one.
-        if e.code == 401 and _retry:
+        body_txt = ""
+        try:
+            body_txt = e.read()[:400].decode("utf-8", "ignore")
+        except Exception:  # noqa: BLE001
+            pass
+        # Wrong-tenant / wrong-issuer 401 is NOT retryable: re-minting yields the
+        # same identity token. This happens when the token's identity can't access
+        # the subscription's tenant (common with a single managed identity / SP).
+        non_retryable = ("InvalidAuthenticationTokenTenant" in body_txt
+                         or "wrong issuer" in body_txt.lower())
+        if e.code == 401 and _retry and not non_retryable:
             if VERBOSE:
                 vlog(f"ARM 401 — invalidating token[{subscription or 'default'}] and retrying")
             invalidate_token(subscription)
             return _arm_call(method, url, body, timeout, subscription, _retry=False)
-        body_txt = ""
-        try:
-            body_txt = e.read()[:200].decode("utf-8", "ignore")
-        except Exception:  # noqa: BLE001
-            pass
+        if e.code in (401, 403) and non_retryable and subscription:
+            log(f"    (skip subscription {subscription}: the {AUTH_MODE or 'current'} "
+                f"identity cannot access it — wrong tenant)", err=True)
         if VERBOSE:
             vlog(f"ARM {method} -> HTTP {e.code} ({time.time()-t0:.1f}s) {redact(body_txt)}")
         return None
@@ -764,12 +786,15 @@ def resolve_subscriptions(args):
     chosen = _pick_subs(subs, args)
     want_scope = bool(args.subscription or args.all_subscriptions)
 
-    # ARM REST /subscriptions is SINGLE-tenant (the token's home tenant). If a scope
-    # was requested but didn't fully resolve, enumerate across tenants via az and
-    # retry — this is how --subscription-filter / cross-tenant ids get found.
+    # ARM REST /subscriptions is SINGLE-tenant. If a scope didn't fully resolve,
+    # enumerate across tenants via az and retry — BUT only when the TOKEN itself is
+    # the delegated az user. A managed identity / service principal is a different,
+    # single identity: pulling in az's cross-tenant subscriptions (which it can't
+    # access) just produces wrong-tenant 401s. So gate on AUTH_MODE == "az".
     unmatched_ids = ([v for v in (args.subscription or [])
                       if _GUID_RE.match(v) and v not in {s["id"] for s in chosen}])
-    if USE_REST and (args.all_subscriptions or unmatched_ids or (want_scope and not chosen)):
+    if (USE_REST and AUTH_MODE == "az"
+            and (args.all_subscriptions or unmatched_ids or (want_scope and not chosen))):
         az_subs = list_subscriptions_az()
         if az_subs:
             known = {s["id"] for s in subs}
@@ -782,8 +807,8 @@ def resolve_subscriptions(args):
             subs = list(merged.values())
             chosen = _pick_subs(subs, args)
 
-    # Per-value resolution: a GUID not yet matched is trusted (minted on demand);
-    # a name/glob that matched nothing is reported.
+    # Per-value resolution: a GUID not yet matched is trusted (delegated az mints
+    # its tenant on demand); a name/glob that matched nothing is reported.
     if args.subscription:
         by_id = {s.get("id"): s for s in subs}
         have = {s.get("id") for s in chosen}
@@ -792,6 +817,12 @@ def resolve_subscriptions(args):
             if _GUID_RE.match(val):
                 if val in have:
                     continue
+                if auth_is_single_identity() and val not in by_id:
+                    # A managed identity / SP can only reach subscriptions it was
+                    # granted — trusting an unknown GUID would just 401.
+                    log(f"[scope] subscription {val} is not accessible to the "
+                        f"{AUTH_MODE}; grant it access or use --auth az", err=True)
+                    continue
                 s = by_id.get(val) or {"id": val, "name": val, "state": "Enabled", "tenant": None}
                 log(f"[scope] trusting explicit subscription id {val}"
                     + (f" (tenant {s.get('tenant')})" if s.get("tenant") else ""))
@@ -799,6 +830,16 @@ def resolve_subscriptions(args):
                 have.add(val)
             elif not any(_matches_any([val], n) for n in chosen_names):
                 log(f"[scope] '{val}' matched no subscription id or name", err=True)
+
+    # Managed identity / SP: if nothing matched, show what IS reachable so the user
+    # can see whether it's an access grant or a naming issue (not a tool failure).
+    if not chosen and want_scope and auth_is_single_identity():
+        reachable = [s.get("name", s.get("id")) for s in subs if s.get("state") == "Enabled"]
+        shown = ", ".join(reachable[:12]) + (" ..." if len(reachable) > 12 else "")
+        log(f"[scope] the {AUTH_MODE} can reach {len(reachable)} subscription(s): "
+            f"{shown or '(none)'}", err=True)
+        log("[scope] your --subscription matched none of them. Grant the identity "
+            "access to the target subscription, or run with --auth az.", err=True)
 
     # No scope given: REST -> all enabled (home tenant); az -> current subscription.
     if not chosen and not want_scope:
@@ -822,12 +863,19 @@ def build_app_records(args, subs):
         return (not args.app_service_name) or any(_matches_any(args.app_service_name, s.get("name")) for s in raw)
 
     if USE_REST:
-        # REST tokens are per-subscription (handles cross-tenant guest/Lighthouse),
-        # so inventory each subscription with its own token.
         raw = []
         if want_arm:
             raw = arm_webapp_list(sub_ids, resource_group=args.resource_group)
+        elif auth_is_single_identity():
+            # One identity/token -> a single Graph call across all its subscriptions.
+            raw = graph_inventory(sub_ids)
+            if not graph_matches(raw):
+                log("[inventory] Graph returned no name-filter matches; "
+                    "falling back to ARM REST site list (handles indexing lag)...")
+                raw = arm_webapp_list(sub_ids)
         else:
+            # Delegated az: tokens are per-subscription (cross-tenant guest/Lighthouse),
+            # so inventory each subscription with its own token.
             for sid in sub_ids:
                 raw += graph_inventory([sid], subscription=sid)
             if not graph_matches(raw):
@@ -1311,6 +1359,10 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true", help="echo every az call with timing + applied values (tokens redacted)")
     p.add_argument("--rest", action="store_true", help="use ARM REST instead of the az CLI (~30x faster when az is slow)")
     p.add_argument("--no-token-cache", action="store_true", help="do not read/write the ARM bearer token disk cache (mint fresh each run)")
+    p.add_argument("--auth", choices=["auto", "az", "managed-identity", "service-principal"],
+                   default="auto",
+                   help="token source: auto (SP/MI env/metadata, else az login), or force one. "
+                        "Use 'az' for cross-tenant delegated access; 'managed-identity' on Azure compute.")
     # deploy knobs
     p.add_argument("--creds", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "creds.json"))
     p.add_argument("--dt-include", help="override DT_INCLUDE (else inferred per runtime)")
@@ -1333,10 +1385,11 @@ def main():
     p.add_argument("--ntfy-topic", help="ntfy.sh topic for progress notifications")
     args = p.parse_args()
 
-    global VERBOSE, USE_REST, NO_TOKEN_CACHE
+    global VERBOSE, USE_REST, NO_TOKEN_CACHE, AUTH_PREF
     VERBOSE = args.verbose
     USE_REST = args.rest
     NO_TOKEN_CACHE = args.no_token_cache
+    AUTH_PREF = args.auth
 
     # format resolution
     fmt = args.format
