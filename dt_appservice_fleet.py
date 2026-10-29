@@ -1459,7 +1459,10 @@ def _verify_azure(app):
                    "network-restricted (private endpoint / public access disabled) or DNS is "
                    "overridden. Verify from inside the VNet, or rely on the Dynatrace-side check.")
         elif "403" in err or "forbidden" in err:
-            why = f"SCM {host} returned 403 (access restrictions / IP allowlist on the scm site)."
+            why = (f"SCM {host} returned 403 (IP allowlist on the scm site). Run from an allowed "
+                   "host, or add your IP: az webapp config access-restriction add -g <rg> "
+                   f"-n {app['name']} --scm-site true --rule-name verify --priority 200 "
+                   "--ip-address <your-ip>/32 --action Allow. Or rely on the Dynatrace check.")
         elif "timed out" in err or "timeout" in err:
             why = f"SCM {host} timed out (network path blocked)."
         else:
