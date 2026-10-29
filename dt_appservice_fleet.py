@@ -1328,23 +1328,42 @@ def uninstall_one(app, args):
 
 # ----------------------------------------------------------------------------- verify
 
-def scm_host(app):
-    """Resolve the app's real SCM/Kudu hostname from ARM (handles non-default
-    domains, e.g. sovereign clouds / custom hostnames), falling back to the
-    conventional <name>.scm.azurewebsites.net."""
-    if app.get("_scm_host"):
-        return app["_scm_host"]
-    host = None
+def _fetch_hosts(app):
+    """Resolve the app's real SCM host AND public host from ARM (handles non-default
+    domains / regional SCM names), caching both on the record."""
+    if "_scm_host" in app:
+        return
+    scm = pub = None
     site = arm_resource("GET", app["id"], subscription=app.get("subscription_id"))
     if isinstance(site, dict):
         props = site.get("properties", {}) or {}
         names = props.get("enabledHostNames") or props.get("hostNames") or []
-        scm = [h for h in names if ".scm." in h]
-        if scm:
-            host = scm[0]
-    host = host or f"{app['name']}.scm.azurewebsites.net"
-    app["_scm_host"] = host
-    return host
+        scm = next((h for h in names if ".scm." in h), None)
+        pub = props.get("defaultHostName") or next((h for h in names if ".scm." not in h), None)
+    app["_scm_host"] = scm or f"{app['name']}.scm.azurewebsites.net"
+    app["_app_host"] = pub or f"{app['name']}.azurewebsites.net"
+
+
+def scm_host(app):
+    _fetch_hosts(app)
+    return app["_scm_host"]
+
+
+def app_host(app):
+    _fetch_hosts(app)
+    return app["_app_host"]
+
+
+def drive_traffic(app, n=5):
+    """Hit the app's public URL a few times so the OneAgent has requests to trace
+    (any status counts — a request is a traced request)."""
+    host = app_host(app)
+    for _ in range(n):
+        try:
+            with urllib.request.urlopen(f"https://{host}/", timeout=8) as r:
+                r.read(1)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def kudu_get(app, vfs_path):
@@ -1446,6 +1465,27 @@ def dt_entity_check(app, creds):
                        "or configure dtctl for this tenant)")
 
 
+def dt_confirm(app, creds, timeout=180, traffic=True, interval=20):
+    """Poll Dynatrace for the app's process group, generating traffic between
+    checks, until it appears or `timeout` elapses. Entities take a few minutes to
+    materialize and need traffic — so this actively drives the test."""
+    state, detail = dt_entity_check(app, creds)
+    if state in ("present", "skipped") or timeout <= 0:
+        return state, detail
+    deadline = time.time() + timeout
+    checks = 1
+    while time.time() < deadline:
+        if traffic:
+            drive_traffic(app, 5)
+        time.sleep(max(1, min(interval, deadline - time.time())))
+        checks += 1
+        state, detail = dt_entity_check(app, creds)
+        if state == "present":
+            return state, f"{detail} (after {checks} checks{' + traffic' if traffic else ''})"
+    return state, (f"{detail} — still absent after {checks} checks over {timeout}s"
+                   + (" + traffic" if traffic else ""))
+
+
 def _verify_azure(app):
     """Azure-side verdict from the container docker log (via Kudu). Returns
     (verdict, detail, instrumented_bool_or_None). instrumented is None when the
@@ -1506,19 +1546,32 @@ def _verify_azure(app):
             "no OneAgent lines in recent logs (cold-starting? logging off? not instrumented?)", False)
 
 
-def verify_one(app, creds=None):
+def verify_one(app, creds=None, dt_timeout=0, traffic=True):
     """Confirm the OneAgent actually loaded — distinct from 'deploy succeeded'.
     Checks the Azure container log AND (independently) whether the entity reports
-    in Dynatrace, so SCM being locked down doesn't block confirmation."""
+    in Dynatrace. With dt_timeout > 0 it actively drives traffic and polls Dynatrace
+    until the entity materializes (so SCM lockdown doesn't block confirmation)."""
     az_verdict, az_detail, az_ok = _verify_azure(app)
     res = {"name": app["name"], "rg": app["resource_group"],
            "verdict": az_verdict, "detail": az_detail}
 
     dt_state = None
     if creds:
-        dt_state, dt_detail = dt_entity_check(app, creds)
+        dt_state, dt_detail = dt_confirm(app, creds, timeout=dt_timeout, traffic=traffic)
         res["dt_state"] = dt_state
         res["detail"] += f"  |  Dynatrace: {dt_state} — {dt_detail}"
+        # Interpret "absent" using the Azure-side evidence:
+        if dt_state == "absent":
+            if az_ok:
+                res["detail"] += (" (NB: the container log shows the agent loaded + connected, "
+                                  "so this is materialization lag / an idle app — give it more "
+                                  "time + traffic, or raise --dt-timeout)")
+            elif az_ok is False:
+                res["detail"] += (" (and the container log shows NO/failed agent — likely fail-open: "
+                                  "check DT_API_TOKEN scope + DT_ENDPOINT for this tenant, and egress)")
+            else:  # az unreachable
+                res["detail"] += (" (container log unreachable, so this is the only signal — if it "
+                                  "stays absent, suspect fail-open: token/endpoint/egress)")
 
     # Dynatrace "present" is authoritative — the process group IS reporting.
     if dt_state == "present":
@@ -1592,6 +1645,8 @@ def main():
     p.add_argument("--verify", action="store_true", help="deploy: after deploying, confirm injection (container log + Dynatrace entity) inline")
     p.add_argument("--no-dt-check", action="store_true", help="verify: skip the Dynatrace-side entity check (container log only)")
     p.add_argument("--verify-wait", type=int, default=60, help="deploy --verify: seconds to wait before verifying (cold start + agent connect)")
+    p.add_argument("--dt-timeout", type=int, default=180, help="verify: poll Dynatrace up to N seconds for the entity, driving traffic (0 = single check)")
+    p.add_argument("--no-traffic", action="store_true", help="verify: do not generate traffic to the app while polling Dynatrace")
     # notify
     p.add_argument("--ntfy-topic", help="ntfy.sh topic for progress notifications")
     args = p.parse_args()
@@ -1639,11 +1694,12 @@ def main():
                 vcreds = load_creds(args.creds)
             except SystemExit:
                 vcreds = None
-        log(f"[verify] reading container logs{' + Dynatrace entities' if vcreds else ''} "
+        poll = args.dt_timeout if vcreds else 0
+        log(f"[verify] container log{' + Dynatrace (poll ' + str(poll) + 's, traffic)' if poll else (' + Dynatrace' if vcreds else '')} "
             f"for {len(records)} app(s)...")
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            for r in ex.map(lambda a: verify_one(a, vcreds), records):
+            for r in ex.map(lambda a: verify_one(a, vcreds, poll, not args.no_traffic), records):
                 results.append(r)
                 log(f"    {r['verdict']:32}  {r['name']}: {r['detail']}")
         ok = sum(1 for r in results if r["verdict"].startswith(("INSTRUMENTED", "CONFIRMED")))
@@ -1750,10 +1806,12 @@ def main():
                     if any(x["name"] == r["name"] and x["status"] == "deployed" for x in results)]
         if deployed:
             vcreds = creds if not args.no_dt_check else None
-            log(f"\n[verify] waiting {args.verify_wait}s for cold start + agent connect...")
+            poll = args.dt_timeout if vcreds else 0
+            log(f"\n[verify] waiting {args.verify_wait}s for cold start + agent connect"
+                + (f", then polling Dynatrace up to {poll}s (driving traffic)" if poll else "") + "...")
             sleep_with_heartbeat(args.verify_wait, "verify wait")
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-                for v in ex.map(lambda a: verify_one(a, vcreds), deployed):
+                for v in ex.map(lambda a: verify_one(a, vcreds, poll, not args.no_traffic), deployed):
                     log(f"    {v['verdict']:32}  {v['name']}: {v['detail']}")
 
     if args.ntfy_topic:

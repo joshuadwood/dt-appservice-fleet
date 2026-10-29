@@ -65,6 +65,17 @@ The **Dynatrace-side** check needs a read credential: add `dtApiToken` (classic 
 with `entities.read`) to `creds.json`, **or** have `dtctl` configured for the tenant
 (the tool auto-detects the context). Skip it with `--no-dt-check`.
 
+**It actively drives the test.** When a Dynatrace read credential is present, `verify`
+(and `deploy --verify`) **generates traffic to the app and polls Dynatrace** until the
+process group materializes — up to `--dt-timeout` seconds (default 180; raise it for
+cold/idle apps). `--no-traffic` disables the traffic generation. This is the path to
+use when SCM/Kudu is IP-restricted (the container-log check is blocked but the
+Dynatrace confirmation still works):
+```bash
+python3 dt_appservice_fleet.py verify --auth az --subscription <sub> \
+    --app-service-name "<app>" --rest --dt-timeout 300
+```
+
 ## 4. Uninstall (revert)
 
 ```bash
