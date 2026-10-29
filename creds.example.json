@@ -3,6 +3,8 @@
   "credentials": {
     "dtTenantId": "<env-id, e.g. abc12345>",
     "dtApiEnvUrl": "https://<env-id>.live.dynatrace.com",
-    "dtPaasToken": "dt0c01.<PaaS token with InstallerDownload scope>"
+    "dtPaasToken": "dt0c01.<PaaS token with InstallerDownload scope>",
+    "_dtApiToken_comment": "OPTIONAL. Classic API token with 'entities.read' — enables the Dynatrace-side entity check in `verify` / `deploy --verify`. Without it, the tool falls back to dtctl (if a context is configured for this tenant).",
+    "dtApiToken": "dt0c01.<optional API token with entities.read>"
   }
 }

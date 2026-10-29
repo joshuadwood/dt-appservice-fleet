@@ -44,17 +44,26 @@ Interrupted? Re-run the **exact same command** — it skips the apps already don
 ## 3b. Verify it actually instrumented
 
 `deploy` success means *config applied + restarts triggered* — not that the agent
-loaded (with `--resilient` fail-open, a failed download still "succeeds"). Confirm
-from the container log:
+loaded (with `--resilient` fail-open, a failed download still "succeeds"). `verify`
+checks **both sides**: the Azure container log (agent loaded + connected) *and*
+Dynatrace (the process group actually reporting):
 
 ```bash
 python3 dt_appservice_fleet.py verify \
     --subscription prod --app-service-name "web-*" --rest -v
+
+# or confirm inline, right after deploying:
+python3 dt_appservice_fleet.py deploy ... --verify
 ```
-Per-app verdict: **INSTRUMENTED (connected)** ✅ · **FAIL-OPEN — NOT instrumented**
-(agent download failed — check the PaaS token/endpoint for that tenant) · **injected
-but INACTIVATED** (tenant disabled the process group) · **no agent markers** (idle /
-cold — hit the app URL to wake it, then re-verify).
+Per-app verdict: **CONFIRMED (Azure + Dynatrace)** ✅ · **INSTRUMENTED (connected)**
+(Azure-side only; DT check skipped/absent) · **FAIL-OPEN — NOT instrumented** (agent
+download failed — check the PaaS token/endpoint for that tenant) · **injected but
+INACTIVATED** (tenant disabled the process group) · **no agent markers** (idle/cold —
+hit the app URL, then re-verify).
+
+The **Dynatrace-side** check needs a read credential: add `dtApiToken` (classic token
+with `entities.read`) to `creds.json`, **or** have `dtctl` configured for the tenant
+(the tool auto-detects the context). Skip it with `--no-dt-check`.
 
 ## 4. Uninstall (revert)
 

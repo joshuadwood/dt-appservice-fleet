@@ -54,6 +54,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -507,16 +508,23 @@ def append_state(path, app, res):
         log(f"    (warning: could not write state file: {redact(str(e))})", err=True)
 
 
-def load_creds(path):
+def load_creds(path, require_paas=False):
     with open(path) as fh:
         data = json.load(fh)
     c = data.get("credentials", data)
     env_url = c.get("dtApiEnvUrl", "").rstrip("/")
     paas = c.get("dtPaasToken")
-    tenant = c.get("dtTenantId")
-    if not env_url or not paas:
-        raise SystemExit(f"creds file {path} missing dtApiEnvUrl / dtPaasToken")
-    return {"env_url": env_url, "paas_token": paas, "tenant": tenant}
+    if not env_url:
+        raise SystemExit(f"creds file {path} missing dtApiEnvUrl")
+    if require_paas and not paas:
+        raise SystemExit(f"creds file {path} missing dtPaasToken (needed for deploy)")
+    return {
+        "env_url": env_url,
+        "paas_token": paas,
+        "tenant": c.get("dtTenantId"),
+        # optional read token for the Dynatrace-side entity check (entities.read)
+        "api_token": c.get("dtApiToken") or c.get("dtReadToken"),
+    }
 
 
 # ----------------------------------------------------------------------------- classification
@@ -1334,10 +1342,94 @@ def kudu_get(app, vfs_path):
         return None
 
 
-def verify_one(app):
-    """Confirm (from the container log) whether the OneAgent actually loaded —
-    distinct from 'deploy succeeded'. Reads the newest container docker log via
-    Kudu and classifies the wrapper + agent markers."""
+# ---- Dynatrace-side confirmation (does the entity actually report?) ----------
+# Needs a Dynatrace READ credential. Two options, preferred first:
+#   1. creds.dtApiToken  — classic API token with `entities.read`  -> /api/v2/entities
+#   2. dtctl             — a configured context for the tenant (user OAuth)  -> DQL
+# Without either, the DT-side check is skipped (the Azure-side log check still runs).
+
+_DT_TAG = "[Environment]azure.app_service_name:{name}"
+
+
+def _dt_check_api(creds, name):
+    """Query /api/v2/entities for the app's process group by our tag."""
+    sel = (f'type("PROCESS_GROUP_INSTANCE"),'
+           f'tag("azure.app_service_name:{name}")')
+    url = (f"{creds['env_url']}/api/v2/entities?entitySelector={urllib.parse.quote(sel)}"
+           f"&from=now-24h&pageSize=20&fields=tags")
+    req = urllib.request.Request(url, headers={"Authorization": f"Api-Token {creds['api_token']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read())
+        ents = d.get("entities", [])
+        if ents:
+            return "present", f"{ents[0].get('displayName')} ({ents[0].get('entityId')})"
+        return "absent", "no matching process group in Dynatrace (last 24h)"
+    except urllib.error.HTTPError as e:
+        return "skipped", f"entities API HTTP {e.code} — token needs the 'entities.read' scope"
+    except Exception as e:  # noqa: BLE001
+        return "skipped", f"entities API error: {redact(str(e))}"
+
+
+def _dtctl_bin():
+    return shutil.which("dtctl") or next(
+        (p for p in [os.path.expanduser("~/.local/bin/dtctl"), "/usr/local/bin/dtctl"]
+         if os.path.exists(p)), None)
+
+
+def _dtctl_context(dtctl, tenant):
+    try:
+        out = subprocess.run([dtctl, "config", "get-contexts", "-o", "json", "--plain"],
+                             capture_output=True, text=True, timeout=30)
+        data = json.loads(out.stdout or "null")
+        ctxs = data.get("result", data) if isinstance(data, dict) else data
+        for c in ctxs or []:
+            if tenant and tenant.lower() in (str(c.get("Environment", "")) + str(c.get("Name", ""))).lower():
+                return c.get("Name")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _dt_check_dtctl(tenant, name):
+    dtctl = _dtctl_bin()
+    if not dtctl:
+        return None
+    ctx = _dtctl_context(dtctl, tenant)
+    if not ctx:
+        return None
+    dql = (f'fetch dt.entity.process_group_instance, from:now()-24h | fieldsAdd tags '
+           f'| filter in("{_DT_TAG.format(name=name)}", tags) '
+           f'| fields name=entity.name, id | limit 5')
+    try:
+        out = subprocess.run([dtctl, "query", dql, "--context", ctx, "-o", "json", "--plain"],
+                             capture_output=True, text=True, timeout=90)
+        recs = (json.loads(out.stdout or "{}") or {}).get("records", [])
+        if recs:
+            return "present", f"{recs[0].get('name')} ({recs[0].get('id')}) via dtctl/{ctx}"
+        return "absent", f"no matching process group in Dynatrace (dtctl/{ctx}, last 24h)"
+    except Exception as e:  # noqa: BLE001
+        return "skipped", f"dtctl query error: {redact(str(e))}"
+
+
+def dt_entity_check(app, creds):
+    """(state, detail) with state in {present, absent, skipped}."""
+    if not creds:
+        return "skipped", "no creds for Dynatrace-side check"
+    name = app["name"]
+    if creds.get("api_token"):
+        return _dt_check_api(creds, name)
+    res = _dt_check_dtctl(creds.get("tenant"), name)
+    if res is not None:
+        return res
+    return ("skipped", "no Dynatrace read path (add creds.dtApiToken with 'entities.read', "
+                       "or configure dtctl for this tenant)")
+
+
+def verify_one(app, creds=None):
+    """Confirm the OneAgent actually loaded — distinct from 'deploy succeeded'.
+    Reads the newest container docker log via Kudu (Azure side) and, when a
+    Dynatrace read credential is available, confirms the entity reports (DT side)."""
     name = app["name"]
     res = {"name": name, "rg": app["resource_group"], "verdict": "", "detail": ""}
     listing = kudu_get(app, "LogFiles/")
@@ -1390,6 +1482,14 @@ def verify_one(app):
     else:
         res["verdict"] = "no agent markers"
         res["detail"] = "no OneAgent lines in recent logs (cold-starting? logging off? not instrumented?)"
+
+    # Dynatrace-side confirmation: is the process group actually reporting?
+    if creds:
+        dt_state, dt_detail = dt_entity_check(app, creds)
+        res["dt_state"] = dt_state
+        res["detail"] += f"  |  Dynatrace: {dt_state} — {dt_detail}"
+        if dt_state == "present" and res["verdict"].startswith("INSTRUMENTED"):
+            res["verdict"] = "CONFIRMED (Azure + Dynatrace)"
     return res
 
 
@@ -1456,6 +1556,9 @@ def main():
     p.add_argument("--force", action="store_true", help="deploy: re-apply to apps already instrumented (default skips them)")
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt for mutating modes")
     p.add_argument("--state-file", help="JSONL checkpoint for resumable rollouts: completed apps are recorded and skipped on re-run (errors/unknowns are retried)")
+    p.add_argument("--verify", action="store_true", help="deploy: after deploying, confirm injection (container log + Dynatrace entity) inline")
+    p.add_argument("--no-dt-check", action="store_true", help="verify: skip the Dynatrace-side entity check (container log only)")
+    p.add_argument("--verify-wait", type=int, default=60, help="deploy --verify: seconds to wait before verifying (cold start + agent connect)")
     # notify
     p.add_argument("--ntfy-topic", help="ntfy.sh topic for progress notifications")
     args = p.parse_args()
@@ -1497,15 +1600,22 @@ def main():
     if args.mode == "verify":
         if not records:
             raise SystemExit("no apps matched the scope to verify")
-        log(f"[verify] reading container logs for {len(records)} app(s)...")
+        vcreds = None
+        if not args.no_dt_check:
+            try:
+                vcreds = load_creds(args.creds)
+            except SystemExit:
+                vcreds = None
+        log(f"[verify] reading container logs{' + Dynatrace entities' if vcreds else ''} "
+            f"for {len(records)} app(s)...")
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            for r in ex.map(verify_one, records):
+            for r in ex.map(lambda a: verify_one(a, vcreds), records):
                 results.append(r)
-                log(f"    {r['verdict']:30}  {r['name']}: {r['detail']}")
-        ok = sum(1 for r in results if r["verdict"].startswith("INSTRUMENTED"))
+                log(f"    {r['verdict']:32}  {r['name']}: {r['detail']}")
+        ok = sum(1 for r in results if r["verdict"].startswith(("INSTRUMENTED", "CONFIRMED")))
         bad = [r for r in results if "NOT instrumented" in r["verdict"] or "INACTIVATED" in r["verdict"]]
-        log(f"\n[verify] {ok}/{len(results)} confirmed instrumented + connected")
+        log(f"\n[verify] {ok}/{len(results)} confirmed instrumented")
         for r in bad:
             log(f"    !! {r['name']}: {r['verdict']}", err=True)
         return
@@ -1577,7 +1687,7 @@ def main():
         if resp != "y":
             raise SystemExit("aborted")
 
-    creds = load_creds(args.creds) if args.mode == "deploy" else None
+    creds = load_creds(args.creds, require_paas=True) if args.mode == "deploy" else None
     if args.ntfy_topic:
         notify(args.ntfy_topic, f"DT Fleet — {args.mode} starting",
                f"{args.mode} on {len(actionable)} app(s).", tags="gear")
@@ -1600,6 +1710,19 @@ def main():
     for x in results:
         if x["status"] in ("error", "needs-input"):
             log(f"    !! {x['name']}: {x['status']} — {x['detail']}", err=True)
+
+    # Inline verification after a real deploy (container log + Dynatrace entity).
+    if args.mode == "deploy" and args.verify and not args.what_if:
+        deployed = [r for r in actionable
+                    if any(x["name"] == r["name"] and x["status"] == "deployed" for x in results)]
+        if deployed:
+            vcreds = creds if not args.no_dt_check else None
+            log(f"\n[verify] waiting {args.verify_wait}s for cold start + agent connect...")
+            sleep_with_heartbeat(args.verify_wait, "verify wait")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                for v in ex.map(lambda a: verify_one(a, vcreds), deployed):
+                    log(f"    {v['verdict']:32}  {v['name']}: {v['detail']}")
+
     if args.ntfy_topic:
         notify(args.ntfy_topic, f"DT Fleet — {args.mode} complete",
                f"{ok}/{len(results)} {args.mode} ok.", tags="white_check_mark")
