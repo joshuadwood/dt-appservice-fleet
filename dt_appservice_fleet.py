@@ -1328,17 +1328,37 @@ def uninstall_one(app, args):
 
 # ----------------------------------------------------------------------------- verify
 
+def scm_host(app):
+    """Resolve the app's real SCM/Kudu hostname from ARM (handles non-default
+    domains, e.g. sovereign clouds / custom hostnames), falling back to the
+    conventional <name>.scm.azurewebsites.net."""
+    if app.get("_scm_host"):
+        return app["_scm_host"]
+    host = None
+    site = arm_resource("GET", app["id"], subscription=app.get("subscription_id"))
+    if isinstance(site, dict):
+        props = site.get("properties", {}) or {}
+        names = props.get("enabledHostNames") or props.get("hostNames") or []
+        scm = [h for h in names if ".scm." in h]
+        if scm:
+            host = scm[0]
+    host = host or f"{app['name']}.scm.azurewebsites.net"
+    app["_scm_host"] = host
+    return host
+
+
 def kudu_get(app, vfs_path):
     """GET a Kudu/SCM VFS path using the ARM bearer token (no basic auth needed)."""
-    url = f"https://{app['name']}.scm.azurewebsites.net/api/vfs/{vfs_path}"
+    url = f"https://{scm_host(app)}/api/vfs/{vfs_path}"
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {arm_token(app.get('subscription_id'))}"})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read().decode("utf-8", "ignore")
     except Exception as e:  # noqa: BLE001
+        app["_scm_error"] = str(e)
         if VERBOSE:
-            vlog(f"kudu GET {vfs_path} failed: {redact(str(e))}")
+            vlog(f"kudu GET {vfs_path} ({url.split('/api/')[0]}) failed: {redact(str(e))}")
         return None
 
 
@@ -1432,9 +1452,19 @@ def _verify_azure(app):
     log is unreachable (inconclusive), True/False otherwise."""
     listing = kudu_get(app, "LogFiles/")
     if listing is None:
-        return ("unreachable",
-                "could not read container logs via SCM (SCM access restrictions / private "
-                "endpoint? run with -v for the exact error)", None)
+        err = (app.get("_scm_error") or "").lower()
+        host = app.get("_scm_host", f"{app['name']}.scm.azurewebsites.net")
+        if "name or service not known" in err or "name resolution" in err or "nodename nor" in err:
+            why = (f"SCM host {host} does not resolve from here — the app's SCM/public access is "
+                   "network-restricted (private endpoint / public access disabled) or DNS is "
+                   "overridden. Verify from inside the VNet, or rely on the Dynatrace-side check.")
+        elif "403" in err or "forbidden" in err:
+            why = f"SCM {host} returned 403 (access restrictions / IP allowlist on the scm site)."
+        elif "timed out" in err or "timeout" in err:
+            why = f"SCM {host} timed out (network path blocked)."
+        else:
+            why = f"could not read container logs via SCM ({host}); run -v for the exact error."
+        return ("unreachable", why, None)
     try:
         files = [f.get("name", "") for f in json.loads(listing) if isinstance(f, dict)]
     except Exception:  # noqa: BLE001
