@@ -599,13 +599,22 @@ def classify(site):
 
     dt_include = RUNTIME_TO_DT_INCLUDE.get(runtime_family.upper(), "")
 
+    # OS: "linux" iff the kind says so; everything else is Windows. (functionapp,linux
+    # and app,linux,container are Linux; bare functionapp / app are Windows.)
+    os_name = "linux" if is_linux else "windows"
+
+    # Deployable by THIS tool = a Linux "code/core" (built-in image) app with a
+    # runtime OneAgent supports. Containers, Function Apps and Windows are out.
+    deployable = bool(is_linux and deploy_model == "code" and dt_include)
+
     return {
         "kind": site.get("kind") or "",
-        "os": "linux" if is_linux else ("windows" if not is_function or kind == "functionapp" else "linux"),
+        "os": os_name,
         "is_function": is_function,
         "is_container": is_container,
         "is_linux": is_linux,
         "deploy_model": deploy_model,
+        "deployable": deployable,
         "runtime_family": runtime_family,
         "runtime_version": runtime_version,
         "runtime": f"{runtime_family}|{runtime_version}" if runtime_version else runtime_family,
@@ -988,22 +997,25 @@ def ascii_table(headers, rows):
 def render_report(records, fmt):
     dist = distribution_table(records)
     total = len(records)
-    n_code = sum(1 for r in records if r["deploy_model"] == "code")
-    n_cont = sum(1 for r in records if r["deploy_model"] == "container")
-    n_func = sum(1 for r in records if r["deploy_model"] == "function")
-    n_linux_code = sum(1 for r in records if r["deploy_model"] == "code" and r["is_linux"])
+    n_linux = sum(1 for r in records if r["is_linux"])
+    n_windows = total - n_linux
+    n_linux_code = sum(1 for r in records if r["is_linux"] and r["deploy_model"] == "code")
+    n_linux_cont = sum(1 for r in records if r["is_linux"] and r["deploy_model"] == "container")
+    n_linux_func = sum(1 for r in records if r["is_linux"] and r["deploy_model"] == "function")
+    n_deployable = sum(1 for r in records if r.get("deployable"))
     n_instr = sum(1 for r in records if r.get("dt_instrumented"))
 
-    detail_cols = ["subscription_name", "resource_group", "name", "kind",
-                   "runtime", "deploy_model", "registry_type", "dt_instrumented",
-                   "startup_command"]
+    detail_cols = ["subscription_name", "resource_group", "name", "os",
+                   "runtime", "deploy_model", "registry_type", "deployable",
+                   "dt_instrumented", "startup_command"]
 
     if fmt == "json":
         return json.dumps({
             "generated": datetime.now(timezone.utc).isoformat(),
             "summary": {
-                "total": total, "code": n_code, "container": n_cont,
-                "function": n_func, "linux_code_deployable": n_linux_code,
+                "total": total, "linux": n_linux, "windows": n_windows,
+                "linux_code": n_linux_code, "linux_container": n_linux_cont,
+                "linux_function": n_linux_func, "deployable": n_deployable,
                 "already_instrumented": n_instr,
             },
             "distribution": dist,
@@ -1026,11 +1038,14 @@ def render_report(records, fmt):
     out.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
     out.append("")
     out.append(("## " if md else "") + "Summary")
-    out.append(f"  Total App Services assessed : {total}")
-    out.append(f"  Code / core (built-in image): {n_code}  (Linux deployable: {n_linux_code})")
-    out.append(f"  Standalone container        : {n_cont}")
-    out.append(f"  Function Apps (skipped)     : {n_func}")
-    out.append(f"  Already DT-instrumented     : {n_instr}")
+    out.append(f"  Total App Services assessed   : {total}   (Linux {n_linux} / Windows {n_windows})")
+    out.append("  Linux (relevant):")
+    out.append(f"    code/core (built-in image)  : {n_linux_code}"
+               f"   -> DEPLOYABLE by this tool: {n_deployable}  (code + OneAgent-supported runtime)")
+    out.append(f"    standalone container        : {n_linux_cont}   (skipped — needs custom-image/sidecar path)")
+    out.append(f"    Function App                : {n_linux_func}   (skipped — Web-App injection path is inert)")
+    out.append(f"  Windows                       : {n_windows}   (skipped — this tool is Linux-only)")
+    out.append(f"  Already DT-instrumented       : {n_instr}")
     out.append("")
     out.append(("## " if md else "") + "Distribution by runtime x deployment model")
     if md:
@@ -1053,7 +1068,8 @@ def render_report(records, fmt):
             out.append(ascii_table(detail_cols, records))
     else:
         out.append("  (startup command not fetched — run with --detailed for per-app startup/DT state)")
-        out.append(ascii_table(["subscription_name", "name", "kind", "runtime", "deploy_model", "registry_type"], records))
+        out.append(ascii_table(["subscription_name", "name", "os", "runtime",
+                                "deploy_model", "registry_type", "deployable"], records))
     return "\n".join(out)
 
 
@@ -1616,6 +1632,7 @@ def main():
     p.add_argument("--output-file", help="write report to file (.txt/.md/.csv/.json by extension)")
     p.add_argument("--format", choices=["txt", "md", "csv", "json"], help="override output format")
     p.add_argument("--detailed", action="store_true", help="fetch startup command + DT state per app (slower)")
+    p.add_argument("--deployable-only", action="store_true", help="limit to deployable apps: Linux code/core (built-in image) with a OneAgent-supported runtime (excludes Windows, containers, Function Apps)")
     p.add_argument("--use-arm", action="store_true", help="inventory via ARM instead of Resource Graph (immediate; avoids Graph indexing lag)")
     p.add_argument("-v", "--verbose", action="store_true", help="echo every az call with timing + applied values (tokens redacted)")
     p.add_argument("--rest", action="store_true", help="use ARM REST instead of the az CLI (~30x faster when az is slow)")
@@ -1670,7 +1687,12 @@ def main():
     log(f"[scope] {len(subs)} subscription(s): " + ", ".join(s['name'] for s in subs))
 
     records = build_app_records(args, subs)
-    log(f"[inventory] {len(records)} App Service(s) in scope")
+    log(f"[inventory] {len(records)} App Service(s) in scope "
+        f"(Linux {sum(1 for r in records if r['is_linux'])} / "
+        f"Windows {sum(1 for r in records if not r['is_linux'])})")
+    if getattr(args, "deployable_only", False):
+        records = [r for r in records if r.get("deployable")]
+        log(f"[inventory] {len(records)} deployable (Linux code/core + supported runtime) after --deployable-only")
 
     # Assess enriches all records (if --detailed) then reports. Mutating modes
     # enrich only the candidate set (and, when resuming, only the not-yet-done ones).

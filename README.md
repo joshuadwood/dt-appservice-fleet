@@ -58,13 +58,22 @@ and `--name-filter` remain as aliases.
 **ARM REST API** instead of the `az` CLI. See [Performance](#performance-the-az-cli-tax)
 — on hosts where `az` is slow this is ~30× faster.
 
-The report classifies every app by **runtime** and by **deployment model**:
+The report identifies every app by **name**, **OS** (`linux`/`windows`), **runtime**
+(`NODE|20-lts`, `PYTHON|3.12`, `JAVA|17`, …), **deployment model**, **registry**
+(for containers), and an explicit **`deployable`** flag. The summary partitions the
+fleet cleanly (Linux code / container / function / Windows):
 
 - `code/core` — bring-your-own-code on the platform built-in image → **deployable**
-  via this tool (if Linux).
+  (if Linux **and** a OneAgent-supported runtime).
 - `container:<ACR|JFrog|MCR|GHCR|DockerHub|Other>` — standalone container →
   needs the custom-image/sidecar path, **skipped** by deploy.
 - `function` — Function App → the Web-App injection path is inert, **skipped**.
+- **Windows** — **skipped**; this tool is **Linux-only** (deploy never touches a
+  non-Linux app). Pass `--deployable-only` to limit the inventory to just the
+  relevant Linux code/core apps.
+
+`deployable = Linux AND code/core AND OneAgent-supported runtime` — so e.g. a Linux
+**WordPress** app shows as `code` but `deployable=False` (unsupported runtime).
 
 ## 2. Deploy OneAgent
 
