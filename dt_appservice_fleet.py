@@ -1426,35 +1426,26 @@ def dt_entity_check(app, creds):
                        "or configure dtctl for this tenant)")
 
 
-def verify_one(app, creds=None):
-    """Confirm the OneAgent actually loaded — distinct from 'deploy succeeded'.
-    Reads the newest container docker log via Kudu (Azure side) and, when a
-    Dynatrace read credential is available, confirms the entity reports (DT side)."""
-    name = app["name"]
-    res = {"name": name, "rg": app["resource_group"], "verdict": "", "detail": ""}
+def _verify_azure(app):
+    """Azure-side verdict from the container docker log (via Kudu). Returns
+    (verdict, detail, instrumented_bool_or_None). instrumented is None when the
+    log is unreachable (inconclusive), True/False otherwise."""
     listing = kudu_get(app, "LogFiles/")
     if listing is None:
-        res["verdict"] = "unreachable"
-        res["detail"] = "could not read container logs via SCM (Linux app? access? basic-auth/network?)"
-        return res
+        return ("unreachable",
+                "could not read container logs via SCM (SCM access restrictions / private "
+                "endpoint? run with -v for the exact error)", None)
     try:
         files = [f.get("name", "") for f in json.loads(listing) if isinstance(f, dict)]
     except Exception:  # noqa: BLE001
         files = []
     docker = sorted(f for f in files if f.endswith("default_docker.log"))
     if not docker:
-        res["verdict"] = "no-log"
-        res["detail"] = "no *_default_docker.log yet (enable App Service logging, or no recent boot)"
-        return res
-    # Boot markers (install/LD_PRELOAD) rotate out of the current file, so read the
-    # newest few logs together; the agent's live "Connected to ..." lines are enough
-    # on their own to prove instrumentation.
+        return ("no-log", "no *_default_docker.log yet (enable App Service logging, or no recent boot)", None)
     chunks = [c for c in (kudu_get(app, f"LogFiles/{fn}") for fn in docker[-3:]) if c]
     t = "\n".join(chunks).lower()
     if not t:
-        res["verdict"] = "unreachable"
-        res["detail"] = "container log fetched empty"
-        return res
+        return ("unreachable", "container log fetched empty", None)
 
     fail_open = "[dt-fleet] warning: oneagent unavailable" in t
     boot = ("[dt-fleet] oneagent:" in t) or ("liboneagentproc" in t) or ("unpacking to" in t)
@@ -1464,32 +1455,41 @@ def verify_one(app, creds=None):
                                     "started server process", "booting worker", "serving"))
 
     if not (connected or boot) and fail_open:
-        res["verdict"] = "FAIL-OPEN — NOT instrumented"
-        res["detail"] = ("wrapper could not obtain the agent; app started WITHOUT it. "
-                         "Check DT_API_TOKEN scope + DT_ENDPOINT for this tenant, and egress to it.")
-    elif inactivated:
-        res["verdict"] = "injected but AGENT INACTIVATED"
-        res["detail"] = ("agent loaded but the tenant disabled this process group "
-                         "(monitored technologies / PG rule — see gotchas section 6)")
-    elif connected:
-        res["verdict"] = "INSTRUMENTED (connected)"
-        res["detail"] = ("agent loaded + connected to Dynatrace"
-                         + ("; app launched" if launched else "")
-                         + ("; install confirmed" if boot else ""))
-    elif boot:
-        res["verdict"] = "injected, connection unconfirmed"
-        res["detail"] = "agent loaded; no 'Connected to ...' line yet (cold-starting, or egress blocked)"
-    else:
-        res["verdict"] = "no agent markers"
-        res["detail"] = "no OneAgent lines in recent logs (cold-starting? logging off? not instrumented?)"
+        return ("FAIL-OPEN — NOT instrumented",
+                "wrapper could not obtain the agent; app started WITHOUT it. "
+                "Check DT_API_TOKEN scope + DT_ENDPOINT for this tenant, and egress to it.", False)
+    if inactivated:
+        return ("injected but AGENT INACTIVATED",
+                "agent loaded but the tenant disabled this process group "
+                "(monitored technologies / PG rule — see gotchas section 6)", True)
+    if connected:
+        return ("INSTRUMENTED (connected)",
+                "agent loaded + connected to Dynatrace"
+                + ("; app launched" if launched else "") + ("; install confirmed" if boot else ""), True)
+    if boot:
+        return ("injected, connection unconfirmed",
+                "agent loaded; no 'Connected to ...' line yet (cold-starting, or egress blocked)", True)
+    return ("no agent markers",
+            "no OneAgent lines in recent logs (cold-starting? logging off? not instrumented?)", False)
 
-    # Dynatrace-side confirmation: is the process group actually reporting?
+
+def verify_one(app, creds=None):
+    """Confirm the OneAgent actually loaded — distinct from 'deploy succeeded'.
+    Checks the Azure container log AND (independently) whether the entity reports
+    in Dynatrace, so SCM being locked down doesn't block confirmation."""
+    az_verdict, az_detail, az_ok = _verify_azure(app)
+    res = {"name": app["name"], "rg": app["resource_group"],
+           "verdict": az_verdict, "detail": az_detail}
+
+    dt_state = None
     if creds:
         dt_state, dt_detail = dt_entity_check(app, creds)
         res["dt_state"] = dt_state
         res["detail"] += f"  |  Dynatrace: {dt_state} — {dt_detail}"
-        if dt_state == "present" and res["verdict"].startswith("INSTRUMENTED"):
-            res["verdict"] = "CONFIRMED (Azure + Dynatrace)"
+
+    # Dynatrace "present" is authoritative — the process group IS reporting.
+    if dt_state == "present":
+        res["verdict"] = "CONFIRMED (Azure + Dynatrace)" if az_ok else "CONFIRMED (Dynatrace)"
     return res
 
 
