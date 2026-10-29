@@ -110,6 +110,11 @@ def sleep_with_heartbeat(seconds, label, interval=15):
             log(f"        {label} ... {rem}s remaining")
 
 
+# Observed call latencies (for the deploy-time ETA in the assessment report).
+_AZ_TIMES = []
+_ARM_TIMES = []
+
+
 def run_az(args, *, check=True, timeout=180):
     """Run an `az` command, returning parsed JSON (or raw text if not -o json).
 
@@ -131,6 +136,8 @@ def run_az(args, *, check=True, timeout=180):
             raise RuntimeError(f"az timed out: {redact(' '.join(args[:4]))}...")
         return None
     dt = time.time() - t0
+    if proc.returncode == 0:
+        _AZ_TIMES.append(dt)
     if VERBOSE:
         vlog(f"az {label}  ({dt:.1f}s, rc={proc.returncode})")
     elif dt > 20:
@@ -325,6 +332,7 @@ def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
+        _ARM_TIMES.append(time.time() - t0)
         if VERBOSE:
             vlog(f"ARM {method} {url.split('?')[0].split('/providers/')[-1][:60]} ({time.time()-t0:.1f}s)")
         # Empty 200 (e.g. restart) -> {} (success); errors below -> None.
@@ -994,7 +1002,34 @@ def ascii_table(headers, rows):
     return f"{line}\n{sep}\n{body}"
 
 
-def render_report(records, fmt):
+def _fmt_dur(seconds):
+    if seconds < 90:
+        return f"~{seconds:.0f}s"
+    if seconds < 90 * 60:
+        return f"~{seconds/60:.0f} min"
+    return f"~{seconds/3600:.1f} hr"
+
+
+def deploy_eta(records, restart_wait):
+    """Rough sequential deploy-time estimate for the deployable apps, calibrated
+    to this run's observed call latencies. Deploy does, per app: ~5 ARM ops (REST)
+    or ~4 az ops, plus the --restart-wait sleep between the two restarts."""
+    n = sum(1 for r in records if r.get("deployable"))
+    if not n:
+        return None
+    arm = (sum(_ARM_TIMES) / len(_ARM_TIMES)) if _ARM_TIMES else 2.0
+    az = (sum(_AZ_TIMES) / len(_AZ_TIMES)) if _AZ_TIMES else 15.0
+    rest_app = restart_wait + 5 * arm
+    az_app = restart_wait + 4 * az
+    return {
+        "n": n, "wait": restart_wait,
+        "rest_app": rest_app, "rest_total": n * rest_app, "arm": arm, "arm_cal": bool(_ARM_TIMES),
+        "az_app": az_app, "az_total": n * az_app, "az": az, "az_cal": bool(_AZ_TIMES),
+        "current": "rest" if USE_REST else "az",
+    }
+
+
+def render_report(records, fmt, restart_wait=45):
     dist = distribution_table(records)
     total = len(records)
     n_linux = sum(1 for r in records if r["is_linux"])
@@ -1009,6 +1044,8 @@ def render_report(records, fmt):
                    "runtime", "deploy_model", "registry_type", "deployable",
                    "dt_instrumented", "startup_command"]
 
+    eta = deploy_eta(records, restart_wait)
+
     if fmt == "json":
         return json.dumps({
             "generated": datetime.now(timezone.utc).isoformat(),
@@ -1018,6 +1055,10 @@ def render_report(records, fmt):
                 "linux_function": n_linux_func, "deployable": n_deployable,
                 "already_instrumented": n_instr,
             },
+            "estimated_deploy_seconds": (
+                {"rest": round(eta["rest_total"]), "az": round(eta["az_total"]),
+                 "per_app_rest": round(eta["rest_app"]), "per_app_az": round(eta["az_app"]),
+                 "restart_wait": eta["wait"]} if eta else None),
             "distribution": dist,
             "apps": records,
         }, indent=2, default=str)
@@ -1047,6 +1088,18 @@ def render_report(records, fmt):
     out.append(f"  Windows                       : {n_windows}   (skipped — this tool is Linux-only)")
     out.append(f"  Already DT-instrumented       : {n_instr}")
     out.append("")
+    if eta:
+        cal = "observed this run" if (eta["arm_cal"] or eta["az_cal"]) else "assumed"
+        star_rest = "*" if eta["arm_cal"] else ""
+        star_az = "*" if eta["az_cal"] else ""
+        out.append(("## " if md else "") + f"Estimated deploy time for {eta['n']} deployable app(s)  (sequential)")
+        out.append(f"  via --rest : {_fmt_dur(eta['rest_total'])}"
+                   f"   ({_fmt_dur(eta['rest_app'])}/app = {eta['wait']}s restart-wait + ~5 ARM calls @ {eta['arm']:.1f}s{star_rest})")
+        out.append(f"  via az     : {_fmt_dur(eta['az_total'])}"
+                   f"   ({_fmt_dur(eta['az_app'])}/app = {eta['wait']}s restart-wait + ~4 az calls @ {eta['az']:.0f}s{star_az})")
+        out.append(f"  [*] call latency {cal}; others assumed. The --restart-wait sleep dominates the "
+                   "--rest path — lower it (e.g. --restart-wait 20) or deploy in batches to go faster.")
+        out.append("")
     out.append(("## " if md else "") + "Distribution by runtime x deployment model")
     if md:
         out.append("| runtime | deployment | count |")
@@ -1700,7 +1753,7 @@ def main():
         if args.detailed and records:
             log(f"[enrich] fetching startup command + DT state for {len(records)} app(s)...")
             enrich_parallel(records)
-        report = render_report(records, fmt)
+        report = render_report(records, fmt, restart_wait=args.restart_wait)
         emit(report, args.output_file)
         if args.ntfy_topic:
             notify(args.ntfy_topic, "DT Fleet — assessment complete",

@@ -75,6 +75,13 @@ fleet cleanly (Linux code / container / function / Windows):
 `deployable = Linux AND code/core AND OneAgent-supported runtime` — so e.g. a Linux
 **WordPress** app shows as `code` but `deployable=False` (unsupported runtime).
 
+The assessment also prints an **estimated deploy time** for the deployable apps
+(sequential), calibrated to the call latency observed during the run — e.g.
+`via --rest: ~27 min (~48s/app = 45s restart-wait + ~5 ARM calls @ 0.5s)`. The
+`--restart-wait` sleep dominates the `--rest` path, so lowering it (e.g.
+`--restart-wait 20`) is the main lever. The JSON report includes
+`estimated_deploy_seconds` for scripting.
+
 ## 2. Deploy OneAgent
 
 Mutating. Instruments **Linux code** Web Apps only. Deploy honors every gotcha in
