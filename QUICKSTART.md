@@ -96,6 +96,7 @@ python3 dt_appservice_fleet.py uninstall \
 | `--auth az\|managed-identity\|service-principal` | force the token source (default auto). MI/SP reach only their own subscriptions; `az` resolves cross-tenant. |
 | `--resilient` | persist agent to `/home` (no re-download on restart) + fail-open |
 | `--state-file FILE` | resumable rollout — completed apps skipped on re-run |
+| `--parallel N` | deploy/uninstall N apps at once (~sequential-time/N; overlaps restart-wait). Keep low on `az`; `--rest` handles more. |
 | `--force` | re-apply to already-instrumented apps (default skips them) |
 | `-v` / `--verbose` | echo every call + timing (tokens redacted) — **use if it looks stuck** |
 | `--start-app-cmd "<cmd>"` | required only for apps with **no** existing startup command |

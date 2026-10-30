@@ -78,9 +78,11 @@ fleet cleanly (Linux code / container / function / Windows):
 The assessment also prints an **estimated deploy time** for the deployable apps
 (sequential), calibrated to the call latency observed during the run — e.g.
 `via --rest: ~27 min (~48s/app = 45s restart-wait + ~5 ARM calls @ 0.5s)`. The
-`--restart-wait` sleep dominates the `--rest` path, so lowering it (e.g.
-`--restart-wait 20`) is the main lever. The JSON report includes
-`estimated_deploy_seconds` for scripting.
+`--restart-wait` sleep dominates the `--rest` path, so the two levers are
+**`--parallel N`** (deploy N apps at once — wall-clock ≈ sequential-time ÷ N, since
+the restart-waits overlap) and a lower `--restart-wait`. ARM 429 throttling is retried
+automatically and the `--state-file` checkpoint is thread-safe; keep `--parallel` low
+on the `az` path. The JSON report includes `estimated_deploy_seconds` for scripting.
 
 ## 2. Deploy OneAgent
 

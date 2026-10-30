@@ -319,7 +319,7 @@ def arm_token(subscription=None):
         return tok
 
 
-def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True):
+def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True, _throttle=5):
     headers = {"Authorization": f"Bearer {arm_token(subscription)}"}
     data = None
     if body is not None:
@@ -343,6 +343,15 @@ def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True
             body_txt = e.read()[:400].decode("utf-8", "ignore")
         except Exception:  # noqa: BLE001
             pass
+        # 429 Too Many Requests (ARM throttling) — honor Retry-After and retry.
+        # Likely under high --parallel; retrying keeps a large rollout correct.
+        if e.code == 429 and _throttle > 0:
+            ra = e.headers.get("Retry-After") if e.headers else None
+            wait = int(ra) if (ra and str(ra).isdigit()) else 5
+            if VERBOSE:
+                vlog(f"ARM 429 throttled — waiting {wait}s then retrying ({_throttle} left)")
+            time.sleep(min(wait, 60))
+            return _arm_call(method, url, body, timeout, subscription, _retry, _throttle - 1)
         # Wrong-tenant / wrong-issuer 401 is NOT retryable: re-minting yields the
         # same identity token. This happens when the token's identity can't access
         # the subscription's tenant (common with a single managed identity / SP).
@@ -352,7 +361,7 @@ def _arm_call(method, url, body=None, timeout=60, subscription=None, _retry=True
             if VERBOSE:
                 vlog(f"ARM 401 — invalidating token[{subscription or 'default'}] and retrying")
             invalidate_token(subscription)
-            return _arm_call(method, url, body, timeout, subscription, _retry=False)
+            return _arm_call(method, url, body, timeout, subscription, _retry=False, _throttle=_throttle)
         if e.code in (401, 403) and non_retryable and subscription:
             log(f"    (skip subscription {subscription}: the {AUTH_MODE or 'current'} "
                 f"identity cannot access it — wrong tenant)", err=True)
@@ -498,8 +507,12 @@ def load_state(path):
     return state
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def append_state(path, app, res):
-    """Append one app's outcome to the JSONL checkpoint (flushed per app)."""
+    """Append one app's outcome to the JSONL checkpoint (flushed per app).
+    Thread-safe so parallel workers don't interleave/corrupt lines."""
     rec = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "id": app["id"], "name": app["name"], "rg": app["resource_group"],
@@ -509,9 +522,10 @@ def append_state(path, app, res):
     try:
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(rec) + "\n")
-            f.flush()
+        with _STATE_LOCK:
+            with open(path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
     except Exception as e:  # noqa: BLE001
         log(f"    (warning: could not write state file: {redact(str(e))})", err=True)
 
@@ -1097,8 +1111,9 @@ def render_report(records, fmt, restart_wait=45):
                    f"   ({_fmt_dur(eta['rest_app'])}/app = {eta['wait']}s restart-wait + ~5 ARM calls @ {eta['arm']:.1f}s{star_rest})")
         out.append(f"  via az     : {_fmt_dur(eta['az_total'])}"
                    f"   ({_fmt_dur(eta['az_app'])}/app = {eta['wait']}s restart-wait + ~4 az calls @ {eta['az']:.0f}s{star_az})")
-        out.append(f"  [*] call latency {cal}; others assumed. The --restart-wait sleep dominates the "
-                   "--rest path — lower it (e.g. --restart-wait 20) or deploy in batches to go faster.")
+        out.append(f"  [*] call latency {cal}; others assumed. Sequential; divide by --parallel N "
+                   "(e.g. --parallel 10 -> ~1/10th). The --restart-wait sleep dominates the --rest "
+                   "path, so --parallel and/or a lower --restart-wait are the levers.")
         out.append("")
     out.append(("## " if md else "") + "Distribution by runtime x deployment model")
     if md:
@@ -1342,7 +1357,10 @@ def deploy_one(app, creds, args):
         else:
             run_az(["webapp", "restart", "--ids", app["id"], "-o", "none"])
         log(f"    [{name}] waiting {args.restart_wait}s for the agent to install before restart #2...")
-        sleep_with_heartbeat(args.restart_wait, f"[{name}] install wait")
+        if getattr(args, "parallel", 1) > 1:
+            time.sleep(args.restart_wait)   # no heartbeat under --parallel (avoids interleaved spam)
+        else:
+            sleep_with_heartbeat(args.restart_wait, f"[{name}] install wait")
         log(f"    [{name}] 4/4 restart #2 (instrument)...")
         if USE_REST:
             arm_restart(app)
@@ -1707,6 +1725,10 @@ def main():
                    help="extra DT_TAGS entry shown as [Environment]KEY:VALUE; supports {name}/{rg}/{sub} placeholders (repeatable). "
                         "azure.app_service_name=<site> is always added.")
     p.add_argument("--restart-wait", type=int, default=45, help="seconds between the two restarts")
+    p.add_argument("--parallel", type=int, default=1, metavar="N",
+                   help="deploy/uninstall N apps concurrently (default 1 = sequential). Overlaps the "
+                        "per-app restart-wait; ~sequential-time/N. Keep low on the az path (subprocess "
+                        "contention); --rest handles more. ARM 429 throttling is retried automatically.")
     p.add_argument("--resilient", action="store_true", help="persist agent to /home (survives restarts, no re-download) and launch fail-open (app still starts if OneAgent is unavailable)")
     p.add_argument("--what-if", action="store_true", help="deploy/uninstall: show actions without applying")
     p.add_argument("--force", action="store_true", help="deploy: re-apply to apps already instrumented (default skips them)")
@@ -1856,18 +1878,37 @@ def main():
         notify(args.ntfy_topic, f"DT Fleet — {args.mode} starting",
                f"{args.mode} on {len(actionable)} app(s).", tags="gear")
 
-    results = []
-    for i, r in enumerate(actionable, 1):
-        log(f"[{args.mode}] ({i}/{len(actionable)}) {r['name']} ...")
-        if args.mode == "deploy":
-            res = deploy_one(r, creds, args)
-        else:
-            res = uninstall_one(r, args)
-        log(f"    -> {res['status']}: {res['detail']}")
-        results.append(res)
+    def _run_one(r):
+        res = deploy_one(r, creds, args) if args.mode == "deploy" else uninstall_one(r, args)
         # Checkpoint each app immediately so an interruption loses at most one app.
         if args.state_file and not args.what_if:
             append_state(args.state_file, r, res)
+        return res
+
+    results = []
+    workers = max(1, args.parallel)
+    if workers == 1:
+        for i, r in enumerate(actionable, 1):
+            log(f"[{args.mode}] ({i}/{len(actionable)}) {r['name']} ...")
+            res = _run_one(r)
+            log(f"    -> {res['status']}: {res['detail']}")
+            results.append(res)
+    else:
+        if not USE_REST and workers > 4:
+            log(f"[{args.mode}] WARNING: --parallel {workers} on the az path spawns many az "
+                "subprocesses and can hit 'Module load timeout' — prefer --rest, or lower --parallel.",
+                err=True)
+        total_n = len(actionable)
+        log(f"[{args.mode}] running {total_n} app(s) across {workers} threads "
+            f"(per-app step logs are prefixed with the app name)...")
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_run_one, r) for r in actionable]
+            for fut in concurrent.futures.as_completed(futs):
+                res = fut.result()
+                done += 1
+                log(f"[{args.mode}] ({done}/{total_n}) {res['name']} -> {res['status']}: {res['detail']}")
+                results.append(res)
 
     ok = sum(1 for x in results if x["status"] in ("deployed", "uninstalled", "would-deploy", "would-uninstall"))
     log(f"\n[{args.mode}] done: {ok}/{len(results)} succeeded")
