@@ -1243,6 +1243,46 @@ STARTUP_WRAPPER_RESILIENT = (
     'exec $START_APP_CMD'
 )
 
+# Oryx-preserving wrapper (--preserve-oryx). For Node/Python apps with NO startup
+# command (platform Oryx auto-detect) whose SCM is locked down, so we can't read files
+# to synthesise a launch command. Installs the agent to persistent /home, sets
+# LD_PRELOAD, then invokes Oryx itself to regenerate the platform's own launch — no
+# START_APP_CMD needed.
+#
+# The subtlety that broke the naive version: when the app is a COMPRESSED Oryx build
+# (output.tar.zst in wwwroot), the platform extracts it to a deterministic /tmp/<hash>
+# dir and runs OUR command from there. Calling `oryx create-script -appPath wwwroot`
+# would re-extract to the SAME /tmp/<hash> and die ("directory not empty"). So here we
+# detect the tarball and instead point Oryx at the platform's already-extracted dir
+# (newest /tmp subdir), reusing the venv the platform already set up. For uncompressed
+# deploys (no tarball — the common locked-down case) we use wwwroot directly.
+# ALWAYS pair with --rollback-on-fail: if this still can't produce a working launch,
+# the deploy auto-restores the app so it is never left crash-looping.
+#   (Azure caps AppCommandLine at 1024 chars, so this is kept compact.)
+STARTUP_WRAPPER_ORYX = (
+    'D=/home/dynatrace; '
+    'L=$(find $D -name liboneagentproc.so 2>/dev/null|head -1); '
+    '[ -z "$L" ] && wget --no-check-certificate -O /tmp/dt-i.sh '
+    '"$DT_ENDPOINT/api/v1/deployment/installer/agent/unix/paas-sh/latest'
+    '?Api-Token=$DT_API_TOKEN&flavor=$DT_FLAVOR&include=$DT_INCLUDE&arch=x86" '
+    '&& sh /tmp/dt-i.sh $D '
+    '&& L=$(find $D -name liboneagentproc.so 2>/dev/null|head -1); '
+    'A=/home/site/wwwroot; '
+    '[ -f "$A/output.tar.zst" ] && A=$(ls -dt /tmp/*/ 2>/dev/null|grep -v dynatrace|head -1); '
+    'A=${A:-/home/site/wwwroot}; '
+    'G=/home/dt-oryx.sh; E=""; '
+    '[ "$DT_INCLUDE" = python ] && E="-virtualEnvName antenv"; '
+    'oryx create-script -appPath "$A" -output $G $E || '
+    '{ echo "[dt-fleet] oryx gen failed ($A)"; '
+    '[ -n "$START_APP_CMD" ] && { [ -n "$L" ] && export LD_PRELOAD="$L"; exec $START_APP_CMD; }; exit 1; }; '
+    '[ -n "$L" ] && { echo "[dt-fleet] OneAgent $L app=$A"; export LD_PRELOAD="$L"; } '
+    '|| echo "[dt-fleet] OneAgent unavailable; fail-open"; '
+    'exec bash $G'
+)
+
+# Runtimes for which we trust the Oryx-preserving path. Node + Python are log-confirmed.
+ORYX_PRESERVE_RUNTIMES = {"nodejs", "python"}
+
 DT_MARKER = "dt-oneagent-install.sh"
 
 
@@ -1349,6 +1389,7 @@ def deploy_one(app, creds, args):
     existing = (app.get("startup_command") or "").strip()
     app_settings = app.get("app_settings", {}) or {}
     prior_start = app_settings.get("START_APP_CMD")
+    use_oryx = False
     start_cmd = None
     if existing and not _looks_instrumented(existing):
         start_cmd = existing
@@ -1361,11 +1402,18 @@ def deploy_one(app, creds, args):
         if cmd:
             start_cmd = cmd
             log(f"    [{name}] discovered START_APP_CMD: '{cmd}'  ({note}) — review with --what-if")
-        else:
+        elif not getattr(args, "preserve_oryx", False):
             result["status"] = "needs-input"
             result["detail"] = f"could not discover startup command ({note}); pass --start-app-cmd"
             return result
-    if start_cmd is None:
+    # Oryx-preserving fallback: no command, app relies on the platform's auto-detect, and
+    # the runtime is one we trust Oryx to regenerate. The wrapper calls Oryx at boot
+    # instead of needing a command. STRONGLY pair with --rollback-on-fail (warned below).
+    if start_cmd is None and getattr(args, "preserve_oryx", False) \
+            and not _looks_instrumented(existing) \
+            and app.get("dt_include") in ORYX_PRESERVE_RUNTIMES:
+        use_oryx = True
+    if start_cmd is None and not use_oryx:
         result["status"] = "needs-input"
         if _looks_instrumented(existing):
             result["detail"] = ("already has an installer wrapper as its startup command but no "
@@ -1378,18 +1426,20 @@ def deploy_one(app, creds, args):
                        "nodejs": "npm start   (or: node server.js)",
                        "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
             eg = f" (e.g. '{example}')" if example else ""
+            po = (" Or --preserve-oryx --rollback-on-fail to let the platform's Oryx "
+                  "auto-detect run (no command/SCM needed; auto-reverts if it can't)."
+                  if app.get("dt_include") in ORYX_PRESERVE_RUNTIMES else "")
             if suggestion:
                 result["detail"] = (f"no Startup Command (Oryx default). Detected likely: '{suggestion}' "
                                      f"({note}) — re-run with --discover-start-cmd to apply, or "
-                                     f"--start-app-cmd to set it explicitly.")
+                                     f"--start-app-cmd to set it explicitly.{po}")
             elif "unreachable" in (note or "").lower():
                 result["detail"] = (f"no Startup Command (Oryx default) and SCM/Kudu is IP-restricted, "
                                      f"so auto-detect can't read the files. Pass --start-app-cmd{eg}, "
-                                     f"or run the tool from an SCM-allowed host/IP to use "
-                                     f"--discover-start-cmd.")
+                                     f"or run from an SCM-allowed host for --discover-start-cmd.{po}")
             else:
                 result["detail"] = (f"no Startup Command (Oryx default){'; ' + note if note else ''}. "
-                                     f"Pass --start-app-cmd{eg} or --discover-start-cmd.")
+                                     f"Pass --start-app-cmd{eg} or --discover-start-cmd.{po}")
         return result
 
     include = args.dt_include or app["dt_include"]
@@ -1421,12 +1471,14 @@ def deploy_one(app, creds, args):
     vlog(f"[{name}] DT_TAGS = {dt_tags}")
 
     # Settings as a dict (ARM REST PUT needs a dict; az needs K=V strings).
+    # Under --preserve-oryx start_cmd may be None (the wrapper regenerates it via Oryx);
+    # START_APP_CMD is then written empty and used only as a fallback inside the wrapper.
     settings_dict = {
         "DT_ENDPOINT": creds["env_url"],
         "DT_API_TOKEN": creds["paas_token"],
         "DT_INCLUDE": include,
         "DT_FLAVOR": flavor,
-        "START_APP_CMD": start_cmd,
+        "START_APP_CMD": start_cmd or "",
         # push agent logs to the App Service log stream (container FS is ephemeral)
         "DT_LOGSTREAM": "stdout",
         "DT_LOGLEVELCON": "INFO",
@@ -1440,17 +1492,31 @@ def deploy_one(app, creds, args):
         settings_dict["DT_LOCALTOVIRTUALHOSTNAME"] = \
             args.host_name.format(name=name, rg=rg, sub=app["subscription_id"])
 
-    # Resilient path: persist the agent to the /home Azure Files mount (needs the
-    # storage mount enabled) and launch fail-open.
-    wrapper = STARTUP_WRAPPER_RESILIENT if args.resilient else STARTUP_WRAPPER
-    if args.resilient:
+    # Wrapper selection:
+    #   --preserve-oryx -> regenerate the platform's own launch via Oryx at boot
+    #   --resilient     -> persist agent to /home + fail-open, exec START_APP_CMD
+    #   default         -> install to /opt (ephemeral) + fail-loud, exec START_APP_CMD
+    if use_oryx:
+        wrapper = STARTUP_WRAPPER_ORYX
         settings_dict["WEBSITES_ENABLE_APP_SERVICE_STORAGE"] = "true"
+    elif args.resilient:
+        wrapper = STARTUP_WRAPPER_RESILIENT
+        settings_dict["WEBSITES_ENABLE_APP_SERVICE_STORAGE"] = "true"
+    else:
+        wrapper = STARTUP_WRAPPER
+
+    if use_oryx and not getattr(args, "rollback_on_fail", False):
+        log(f"    [{name}] NOTE: --preserve-oryx without --rollback-on-fail — if Oryx can't "
+            f"regenerate the launch (e.g. unusual build), the app may not start. Add "
+            f"--rollback-on-fail (+ --verify) to auto-revert.", err=True)
 
     if args.what_if:
         result["status"] = "would-deploy"
-        extra = ("".join([" resilient(/home,fail-open)" if args.resilient else "",
+        extra = ("".join([" preserve-oryx(auto-detect,/home,fail-open)" if use_oryx else
+                          (" resilient(/home,fail-open)" if args.resilient else ""),
                           " via-REST" if USE_REST else ""]))
-        result["detail"] = f"START_APP_CMD='{start_cmd}' include={include}{extra}"
+        cmd_desc = "(Oryx auto-detect at boot)" if use_oryx else f"START_APP_CMD='{start_cmd}'"
+        result["detail"] = f"{cmd_desc} include={include}{extra}"
         return result
 
     # Stash the ORIGINAL startup command so uninstall can restore it. Idempotency:
@@ -1472,7 +1538,8 @@ def deploy_one(app, creds, args):
     vlog(f"[{name}] startup wrapper = {wrapper}")
 
     writer = "ARM REST" if USE_REST else "az"
-    wlabel = "resilient wrapper (/home, fail-open)" if args.resilient else "installer wrapper"
+    wlabel = ("Oryx-preserving wrapper (/home, auto-detect, fail-open)" if use_oryx else
+              ("resilient wrapper (/home, fail-open)" if args.resilient else "installer wrapper"))
     try:
         log(f"    [{name}] 1/4 writing {len(settings_dict)} app settings (DT_*, START_APP_CMD) [{writer}]...")
         if USE_REST:
@@ -1503,7 +1570,8 @@ def deploy_one(app, creds, args):
         else:
             run_az(["webapp", "restart", "--ids", app["id"], "-o", "none"])
         result["status"] = "deployed"
-        result["detail"] = f"include={include} START_APP_CMD='{start_cmd}'"
+        result["detail"] = (f"include={include} startup=Oryx-auto-detect" if use_oryx
+                            else f"include={include} START_APP_CMD='{start_cmd}'")
     except Exception as e:  # noqa: BLE001
         result["status"] = "error"
         result["detail"] = redact(str(e))
@@ -1575,6 +1643,32 @@ def scm_host(app):
 def app_host(app):
     _fetch_hosts(app)
     return app["_app_host"]
+
+
+def app_http_ok(app, tries=3, delay=10):
+    """Best-effort health probe of the app's public URL. Returns True if the app is
+    serving HTTP (any status < 500 — the app itself answered), False if it is down
+    (platform 5xx 'Application Error' / container not up / connection fails). Used by
+    --rollback-on-fail to tell 'our startup change broke the app' from a benign
+    agent-not-yet-visible verdict. Retries to ride out cold starts."""
+    host = app_host(app)
+    last = None
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(f"https://{host}/", method="GET",
+                                         headers={"User-Agent": "dt-fleet-health"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status < 500          # app answered
+        except urllib.error.HTTPError as e:
+            last = e.code
+            if e.code < 500:
+                return True                    # app answered (401/403/404/...)
+        except Exception as e:                 # noqa: BLE001 — timeout / conn refused / DNS
+            last = repr(e)
+        if i < tries - 1:
+            time.sleep(delay)
+    vlog(f"[{app['name']}] health probe: app appears DOWN (last={last})")
+    return False
 
 
 def drive_traffic(app, n=5):
@@ -1857,6 +1951,15 @@ def main():
                    help="for apps with no startup command (Oryx implicit default), auto-detect the launch "
                         "command from the app's files via Kudu (package.json / Python entrypoint). "
                         "Best-effort — review with --what-if first (a wrong command would crash the app).")
+    p.add_argument("--preserve-oryx", action="store_true",
+                   help="Node/Python apps with no startup command: inject the agent, then let the "
+                        "platform's own Oryx auto-detect regenerate & run the app at boot — no launch "
+                        "command or SCM/Kudu access needed. Persists agent to /home, fail-open. Handles "
+                        "compressed Oryx builds. STRONGLY recommend pairing with --rollback-on-fail.")
+    p.add_argument("--rollback-on-fail", action="store_true",
+                   help="deploy --verify: if an app is NOT serving HTTP after the verify window "
+                        "(our startup change broke it), automatically uninstall to restore its prior "
+                        "state — so a deploy can never leave an app crash-looping. Use with --preserve-oryx.")
     p.add_argument("--env-tag", default="demo", help="value for DT_TAGS env=")
     p.add_argument("--service-name", help="OTEL_SERVICE_NAME for the Dynatrace service entity; supports {name}/{rg}/{sub} placeholders (default: the app's site name)")
     p.add_argument("--otel-resource-attributes", help="OTEL_RESOURCE_ATTRIBUTES, e.g. 'service.namespace=retail,deployment.environment=prod'")
@@ -2066,9 +2169,37 @@ def main():
             log(f"\n[verify] waiting {args.verify_wait}s for cold start + agent connect"
                 + (f", then polling Dynatrace up to {poll}s (driving traffic)" if poll else "") + "...")
             sleep_with_heartbeat(args.verify_wait, "verify wait")
+            verdicts = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-                for v in ex.map(lambda a: verify_one(a, vcreds, poll, not args.no_traffic), deployed):
+                for a, v in zip(deployed, ex.map(
+                        lambda a: verify_one(a, vcreds, poll, not args.no_traffic), deployed)):
                     log(f"    {v['verdict']:32}  {v['name']}: {v['detail']}")
+                    verdicts[a["name"]] = (a, v)
+
+            # Auto-rollback: if our startup change left an app not serving HTTP, restore
+            # it so it is never left down. Probe health of EVERY deployed app independent
+            # of the agent verdict — the OneAgent can load + connect (so the Azure check
+            # says "INSTRUMENTED") while the actual app command is broken and the app is
+            # down. "Agent loaded" is NOT "app running"; only an HTTP probe tells us the
+            # app is actually serving.
+            if args.rollback_on_fail:
+                log(f"\n[rollback] probing HTTP health of {len(verdicts)} deployed app(s) "
+                    f"(independent of agent verdict)...")
+                rolled = 0
+                for name, (a, v) in verdicts.items():
+                    if app_http_ok(a):
+                        continue   # serving HTTP — fine (agent may still be cold; not a reason to revert)
+                    log(f"    [{name}] NOT serving HTTP after deploy "
+                        f"(verdict was '{v['verdict']}') — rolling back...", err=True)
+                    rb = uninstall_one(a, args)
+                    rolled += 1
+                    log(f"    [{name}] rollback -> {rb['status']}: {rb['detail']}", err=True)
+                    for x in results:
+                        if x["name"] == name:
+                            x["status"] = "rolled-back"
+                            x["detail"] = f"app did not come up; restored ({rb['detail']})"
+                log(f"[rollback] {rolled}/{len(verdicts)} app(s) restored (were not serving HTTP); "
+                    f"the rest are healthy.")
 
     if args.ntfy_topic:
         notify(args.ntfy_topic, f"DT Fleet — {args.mode} complete",

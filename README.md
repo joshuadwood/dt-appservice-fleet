@@ -112,10 +112,25 @@ real launch command. Two ways to supply it:
 - `--discover-start-cmd` — read the app's files via Kudu and replicate Oryx's logic
   (needs SCM/Kudu reachable).
 
-When SCM is IP-restricted and the command is unknown, the real launch is printed in the
-**Azure Portal → Log stream** at boot (`Generating 'gunicorn' command for '<module>:app'`)
-— copy it into `--start-app-cmd`. An app logging `No framework detected; using default
-app` has *no code deployed*; instrument it once the application is actually there.
+When SCM is IP-restricted and the command is unknown, either copy the real launch from
+the **Azure Portal → Log stream** (`Generating 'gunicorn' command for '<module>:app'`)
+into `--start-app-cmd`, **or** use `--preserve-oryx` (no command needed):
+
+- `--preserve-oryx` — **Node/Python, no startup command, locked-down SCM.** Installs the
+  agent to persistent `/home`, then invokes the platform's **own Oryx** at boot to
+  regenerate and run the app with `LD_PRELOAD` injected. Needs no launch command or file
+  access. Handles compressed Oryx builds (`output.tar.zst`) by pointing Oryx at the
+  platform's already-extracted app dir (not `wwwroot`, which would re-extract and
+  collide). The `AppCommandLine` stays within Azure's 1024-char limit.
+- `--rollback-on-fail` — **the safety net; always pair it with `--preserve-oryx` +
+  `--verify`.** After deploy it probes each app's public URL and, if an app is not
+  serving HTTP (our startup change broke it), automatically `uninstall`s to restore its
+  prior state. This is independent of the Dynatrace/agent verdict — the OneAgent can load
+  and connect while the app command is broken and the app is down, so health is judged by
+  an HTTP probe, not by "did the agent attach". A rollout can never leave an app down.
+
+An app logging `No framework detected; using default app` has *no code deployed*;
+instrument it once the application is actually there.
 
 ### Naming & tagging in Dynatrace
 

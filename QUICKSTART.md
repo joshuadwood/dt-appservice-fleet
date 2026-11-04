@@ -87,11 +87,24 @@ real command, so you have two options — pick by what access you have:
 | You know the command | `--start-app-cmd "gunicorn … app:app"` (one value applies to the whole run) |
 | SCM/Kudu reachable | `--discover-start-cmd` — reads the app's files and replicates Oryx |
 
-**SCM locked down and you don't know the command?** The real launch is printed in the
-**Azure Portal → Log stream** at boot (`Generating 'gunicorn' command for '<module>:app'`
-for Python, the `pm2`/`node` line for Node) — copy that into `--start-app-cmd`. If an app
-shows `No framework detected; using default app`, it has **no code deployed** — instrument
-it once your application is actually deployed.
+**SCM locked down and you don't know the command?** Either copy the real launch from the
+**Azure Portal → Log stream** at boot (`Generating 'gunicorn' command for '<module>:app>'`
+for Python, the `pm2`/`node` line for Node) into `--start-app-cmd` — **or** use
+`--preserve-oryx`, which needs no command at all:
+
+```bash
+# Node/Python, blank startup command, SCM IP-restricted — hands-off + safe:
+python3 dt_appservice_fleet.py deploy --subscription prod --app-service-name "web-*" \
+    --rest --preserve-oryx --rollback-on-fail --yes --verify
+```
+`--preserve-oryx` installs the agent to `/home`, then lets the platform's **own Oryx**
+auto-detect and launch the app at boot with `LD_PRELOAD` injected — no command, no SCM
+access. It handles compressed Oryx builds (`output.tar.zst`) by pointing Oryx at the
+already-extracted app dir. **Always add `--rollback-on-fail`** (with `--verify`): after
+deploy it probes each app's HTTP health and, if an app isn't serving, automatically
+uninstalls to restore it — so the rollout can never leave an app down. Validated on
+Node + Python. If an app shows `No framework detected; using default app`, it has **no
+code deployed** — instrument it once your application is actually there.
 
 ## 4. Uninstall (revert)
 
@@ -118,6 +131,8 @@ python3 dt_appservice_fleet.py uninstall \
 | `-v` / `--verbose` | echo every call + timing (tokens redacted) — **use if it looks stuck** |
 | `--start-app-cmd "<cmd>"` | launch command for apps with **no** startup command (Oryx implicit default) |
 | `--discover-start-cmd` | auto-detect that launch command from the app's files (package.json / Python entrypoint) — review with `--what-if` |
+| `--preserve-oryx` | **Node/Python, no startup command, SCM locked down:** inject the agent, then let the platform's own Oryx auto-detect run the app at boot — **no command or SCM access needed.** Handles compressed Oryx builds. Pair with `--rollback-on-fail`. |
+| `--rollback-on-fail` | with `--verify`: if an app isn't serving HTTP after deploy (our change broke it), **auto-uninstall to restore it** — a deploy can never leave an app down. |
 | `--set-host-tag K=V` | extra Dynatrace `[Environment]K:V` tag (repeatable) |
 | `--detailed` | assess: fetch per-app startup cmd + DT state |
 
