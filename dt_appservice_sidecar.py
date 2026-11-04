@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+DT Fleet — SIDECAR path (containerized Linux App Services / BYOC).
+
+A fork of dt_appservice_fleet.py that instruments **container** Web Apps (the apps the
+code/core tool inventories and skips) with the Dynatrace OneAgent via the
+`dynatrace/dynatrace-codemodules` bootstrapper sidecar — per
+https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/integrations/azure-appservice/integrate-oneagent-on-web-app-for-containers
+
+Design: the two paths stay INDEPENDENT. This script never touches the code/core deploy
+logic; it reuses only the stable scaffolding (subscription enumeration, the ARM REST
+client + token cache, inventory/classification, tagging, report plumbing) by importing
+dt_appservice_fleet as a library. A given app is either startup-command-instrumented
+(the other tool) or sidecar-instrumented (this one), never both.
+
+Scope (this build = Phase 1, DISCOVERY): `assess` reports per-container-app sidecar
+readiness. deploy/verify/uninstall/update are defined but gated as not-yet-implemented
+(Phases 2-3). Python-runtime containers are reported `unsupported-runtime` and skipped
+(they belong on the OTel path, which this tool does not implement). Function Apps,
+Windows, and code/core apps are out of scope and ignored.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import dt_appservice_fleet as core
+from dt_appservice_fleet import log, vlog, redact
+
+# sitecontainers ARM schema is richest at 2024-11-01 (GA); core.ARM_API (2023-12-01)
+# also supports the resource but we pin the newer version for writes in Phase 2.
+SITECONTAINER_API = "2024-11-01"
+
+# The fixed contract from the Dynatrace doc (see sidecar-arm-facts memory).
+DT_LIB_PATH = "/home/dynatrace/oneagent/active/agent/lib64/liboneagentproc.so"
+SIDECAR_IMAGE_BASE = "index.docker.io/dynatrace/dynatrace-codemodules"
+SIDECAR_SUCCESS_LOG = "OneAgent has been successfully deployed"
+DEFAULT_SIDECAR_NAME = "dynatrace-bootstrapper"
+# Dynatrace --technology identifiers (reduce bootstrapper footprint).
+DT_TECHNOLOGIES = {"java", "dotnet", "nodejs", "php", "apache", "nginx", "go", "sdk", "all"}
+
+
+# ----------------------------------------------------------------- credentials / DT API
+
+_CONN_INFO = {}
+
+
+def dt_connection_info(creds, network_zone=None):
+    """Fetch tenant token + communication endpoints from the connectioninfo API using
+    the PaaS token creds.json already holds. The sidecar path needs the TENANT token
+    (not the PaaS token) and the connection endpoints. Cached per run."""
+    key = network_zone or "_"
+    if key in _CONN_INFO:
+        return _CONN_INFO[key]
+    base = creds["env_url"].rstrip("/")
+    url = f"{base}/api/v1/deployment/installer/agent/connectioninfo"
+    if network_zone:
+        url += "?" + urllib.parse.urlencode({"networkZone": network_zone})
+    req = urllib.request.Request(url, headers={"Authorization": f"Api-Token {creds['paas_token']}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise SystemExit("connectioninfo API rejected the PaaS token — it needs the "
+                             "InstallerDownload scope. (HTTP %d)" % e.code)
+        raise SystemExit(f"connectioninfo API error: HTTP {e.code}")
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"connectioninfo API unreachable: {e}")
+    endpoints = data.get("communicationEndpoints") or []
+    info = {
+        "tenant": data.get("tenantUUID") or "",
+        "tenant_token": data.get("tenantToken") or "",
+        "connection_point": ";".join(endpoints),
+        "network_zone": network_zone or "",
+    }
+    if not info["tenant"] or not info["tenant_token"] or not info["connection_point"]:
+        raise SystemExit("connectioninfo API response missing tenantUUID/tenantToken/"
+                         "communicationEndpoints — check the environment URL + token.")
+    vlog(f"[dt] connectioninfo: tenant={info['tenant']} "
+         f"token={redact('DT_TENANTTOKEN=' + info['tenant_token'])} "
+         f"endpoints={len(endpoints)}")
+    _CONN_INFO[key] = info
+    return info
+
+
+# -------------------------------------------------------------------- ARM: sitecontainers
+
+def _sc_call(method, app, sub_path="", body=None, api=SITECONTAINER_API):
+    """ARM call against the site (or a sitecontainers sub-path) with the sitecontainers
+    api-version. Returns parsed JSON or None."""
+    url = f"{core.ARM}{app['id']}{sub_path}?api-version={api}"
+    return core._arm_call(method, url, body, 60, app.get("subscription_id"))
+
+
+def list_sitecontainers(app):
+    out = _sc_call("GET", app, "/sitecontainers")
+    if isinstance(out, dict):
+        return out.get("value", []) or []
+    return []
+
+
+# --------------------------------------------------------------------------- discovery
+
+# image-name heuristics -> Dynatrace --technology
+_TECH_PATTERNS = [
+    ("python", ("python", "fastapi", "flask", "django", "gunicorn", "uvicorn")),
+    ("java", ("openjdk", "temurin", "eclipse-temurin", "jre", "jdk", "jetty", "tomcat", "spring")),
+    ("dotnet", ("dotnet", "aspnet", "/dotnet/")),
+    ("nodejs", ("node", "nodejs")),
+    ("php", ("php", "wordpress")),
+    ("go", ("golang", "/go:")),
+    ("nginx", ("nginx",)),
+    ("apache", ("httpd", "apache")),
+]
+
+
+def technology_hint(image, app_settings, tech_map=None, name=""):
+    """Best-effort runtime guess from the image name/tag (+ optional --technology-map).
+    Returns a Dynatrace technology id or "" if unsure. 'python' here is meaningful: it
+    marks the app unsupported on this path."""
+    if tech_map:
+        for pat, tech in tech_map.items():
+            if core._matches_any([pat], name):
+                return tech
+    img = (image or "").lower()
+    for tech, needles in _TECH_PATTERNS:
+        if any(n in img for n in needles):
+            return tech
+    return ""
+
+
+def _container_mode(linux_fx):
+    fx = (linux_fx or "")
+    up = fx.upper()
+    if up == "SITECONTAINERS":
+        return "multi"
+    if up.startswith("DOCKER|"):
+        return "legacy-single"
+    if up.startswith("COMPOSE|"):
+        return "compose"
+    return "none"
+
+
+def sidecar_readiness(app, sidecar_name=DEFAULT_SIDECAR_NAME, tech_map=None):
+    """Populate app['sidecar'] with the readiness block (plan §3). Independent ARM reads;
+    ~5 calls per app. Also sets app['dt_instrumented'] / app['sidecar_status']."""
+    s = app.get("subscription_id")
+    r = {
+        "container_mode": "none", "main_image": "", "app_service_storage": "absent",
+        "existing_sitecontainers": [], "dt_instrumented": False, "dt_version": "",
+        "dt_settings_present": False, "foreign_ld_preload": "", "app_insights": False,
+        "vnet": {}, "egress_review": False, "slots": [], "technology_hint": "",
+        "alpine_hint": False, "always_on": None, "sku_tier": "", "sku_capacity": None,
+        "sku_unsupported": False,
+    }
+
+    # 1) full site GET: siteConfig (linuxFxVersion, vnet, alwaysOn), serverFarmId
+    site = core.arm_resource("GET", app["id"], subscription=s)
+    props = site.get("properties", {}) if isinstance(site, dict) else {}
+    cfg = props.get("siteConfig", {}) or {}
+    linux_fx = cfg.get("linuxFxVersion") or app.get("linuxFx") or ""
+    r["container_mode"] = _container_mode(linux_fx)
+    r["always_on"] = cfg.get("alwaysOn")
+    r["vnet"] = {
+        "route_all": cfg.get("vnetRouteAllEnabled"),
+        "subnet": props.get("virtualNetworkSubnetId") or "",
+        "public_access": props.get("publicNetworkAccess") or "",
+    }
+    r["egress_review"] = bool(r["vnet"]["route_all"] or r["vnet"]["subnet"])
+    server_farm_id = props.get("serverFarmId") or ""
+
+    # legacy single image comes straight from linuxFxVersion
+    if r["container_mode"] == "legacy-single":
+        r["main_image"] = linux_fx.split("|", 1)[1] if "|" in linux_fx else ""
+
+    # 2) app settings: storage, DT_*, App Insights, foreign LD_PRELOAD
+    setres = core.arm_resource("POST", app["id"], "/config/appsettings/list", subscription=s)
+    settings = setres.get("properties", {}) if isinstance(setres, dict) else {}
+    app["app_settings"] = settings
+    r["app_service_storage"] = (settings.get("WEBSITES_ENABLE_APP_SERVICE_STORAGE")
+                                or "absent").lower() if "WEBSITES_ENABLE_APP_SERVICE_STORAGE" in settings else "absent"
+    dt_keys = ("DT_CONNECTION_POINT", "DT_TENANT", "DT_TENANTTOKEN")
+    r["dt_settings_present"] = any(k in settings for k in dt_keys) or ("LD_PRELOAD" in settings)
+    ldp = settings.get("LD_PRELOAD", "")
+    if ldp and ldp.strip() != DT_LIB_PATH:
+        r["foreign_ld_preload"] = ldp
+    r["app_insights"] = any(k in settings for k in (
+        "APPLICATIONINSIGHTS_CONNECTION_STRING", "APPINSIGHTS_INSTRUMENTATIONKEY",
+        "ApplicationInsightsAgent_EXTENSION_VERSION"))
+
+    # 3) existing sitecontainers (multi mode): main image + prior DT sidecar
+    if r["container_mode"] == "multi":
+        for sc in list_sitecontainers(app):
+            scp = sc.get("properties", {}) or {}
+            img = scp.get("image", "")
+            nm = sc.get("name", "")
+            r["existing_sitecontainers"].append({"name": nm, "image": img,
+                                                 "is_main": scp.get("isMain")})
+            if scp.get("isMain"):
+                r["main_image"] = img
+            if "dynatrace-codemodules" in img.lower() or nm == sidecar_name:
+                r["dt_instrumented"] = True
+                r["dt_version"] = img.rsplit(":", 1)[-1] if ":" in img else ""
+
+    # 4) slots
+    slotres = core.arm_resource("GET", app["id"], "/slots", subscription=s)
+    if isinstance(slotres, dict):
+        r["slots"] = [v.get("name", "").split("/")[-1] for v in slotres.get("value", [])]
+
+    # 5) serverfarm SKU
+    if server_farm_id:
+        farm = core.arm_resource("GET", server_farm_id, subscription=s)
+        sku = (farm.get("sku", {}) if isinstance(farm, dict) else {}) or {}
+        r["sku_tier"] = sku.get("tier", "") or sku.get("name", "")
+        r["sku_capacity"] = sku.get("capacity")
+        r["sku_unsupported"] = r["sku_tier"].lower() in ("free", "shared", "dynamic")
+
+    # derived: technology + alpine
+    r["technology_hint"] = technology_hint(r["main_image"], settings, tech_map, app["name"])
+    r["alpine_hint"] = any(t in (r["main_image"] or "").lower() for t in ("alpine", "musl"))
+
+    app["sidecar"] = r
+    app["dt_instrumented"] = r["dt_instrumented"]
+    app["sidecar_status"], app["sidecar_reason"], app["deployable_sidecar"] = \
+        classify_sidecar_status(app, r)
+    return r
+
+
+def classify_sidecar_status(app, r):
+    """Single primary status + reason + deployable_sidecar bool. Precedence matters:
+    report the most important blocker first."""
+    if r["dt_instrumented"]:
+        return "instrumented", f"Dynatrace sidecar present ({r['dt_version'] or 'unknown tag'})", False
+    if r["container_mode"] == "none":
+        return "not-container", "not a container app (out of scope for the sidecar path)", False
+    if r["container_mode"] == "compose":
+        return "unsupported-compose", "Docker Compose multi-container — unsupported by sidecars", False
+    if r["technology_hint"] == "python":
+        return "unsupported-runtime", "Python container — use the OTel path (not this tool)", False
+    if r["sku_unsupported"]:
+        return "unsupported-sku", f"SKU '{r['sku_tier']}' does not support sidecars (needs Basic+)", False
+    if r["foreign_ld_preload"]:
+        return "needs-input", f"foreign LD_PRELOAD set ({r['foreign_ld_preload']}) — resolve manually", False
+    # From here the app is fundamentally eligible; remaining items are approved config changes.
+    deployable = True
+    if r["container_mode"] == "legacy-single":
+        status, reason = "needs-conversion", "legacy single-container (DOCKER|) — needs --allow-convert to sitecontainers"
+    elif r["app_service_storage"] != "true":
+        status, reason = "needs-storage", f"WEBSITES_ENABLE_APP_SERVICE_STORAGE={r['app_service_storage']} — needs --enable-storage"
+    elif r["alpine_hint"]:
+        status, reason = "needs-review", "Alpine/musl image — sidecar musl support unverified (use --allow-alpine)"
+    else:
+        status, reason = "sidecar-ready", "multi-container, storage on, supported runtime"
+    extra = []
+    if r["app_insights"]:
+        extra.append("App Insights present (conflict — use --disable-app-insights)")
+    if r["egress_review"]:
+        extra.append("VNet egress — verify reachability of Docker Hub + DT_CONNECTION_POINT")
+    if r["slots"]:
+        extra.append(f"{len(r['slots'])} slot(s): {','.join(r['slots'])}")
+    if extra:
+        reason += "  [" + "; ".join(extra) + "]"
+    return status, reason, deployable
+
+
+# ------------------------------------------------------------------------------ report
+
+_STATUS_BUCKET = {
+    "sidecar-ready": "sidecar-ready",
+    "needs-conversion": "needs-conversion",
+    "needs-storage": "needs-conversion",
+    "needs-review": "needs-review",
+    "instrumented": "instrumented",
+    "unsupported-runtime": "unsupported",
+    "unsupported-compose": "unsupported",
+    "unsupported-sku": "unsupported",
+    "needs-input": "needs-review",
+}
+
+
+def render_sidecar_report(records, fmt="txt"):
+    containers = [r for r in records if r.get("sidecar_status") not in (None, "not-container")]
+    if fmt == "json":
+        return json.dumps([{
+            "name": r["name"], "subscription": r.get("subscription_name"),
+            "resource_group": r["resource_group"], "status": r["sidecar_status"],
+            "deployable_sidecar": r.get("deployable_sidecar"),
+            "reason": r.get("sidecar_reason"), "readiness": r.get("sidecar"),
+        } for r in containers], indent=2)
+
+    buckets = {}
+    for r in containers:
+        buckets.setdefault(_STATUS_BUCKET.get(r["sidecar_status"], "other"), []).append(r)
+    lines = []
+    lines.append("DT Fleet — Sidecar (container) readiness")
+    lines.append("=" * 72)
+    total = len(containers)
+    lines.append(f"{total} container Linux App Service(s) in scope")
+    order = ["sidecar-ready", "needs-conversion", "needs-review", "instrumented", "unsupported", "other"]
+    for b in order:
+        if buckets.get(b):
+            lines.append(f"  {b:16} {len(buckets[b])}")
+    lines.append("")
+    hdr = f"{'STATUS':17} {'MODE':13} {'TECH':8} {'SKU':10} {'APP'}"
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+    for r in sorted(containers, key=lambda x: (x["sidecar_status"], x["name"])):
+        sc = r.get("sidecar", {})
+        lines.append(f"{r['sidecar_status']:17} {sc.get('container_mode',''):13} "
+                     f"{sc.get('technology_hint','') or '?':8} {sc.get('sku_tier','') or '?':10} "
+                     f"{r['subscription_name']}/{r['name']}")
+        lines.append(f"{'':17} -> {r.get('sidecar_reason','')}")
+    return "\n".join(lines)
+
+
+# -------------------------------------------------------------------------------- main
+
+def _phase2(action):
+    log(f"[sidecar] '{action}' is Phase 2/3 (deploy/verify/uninstall/update) and is not "
+        f"enabled in this build. Phase 1 = discovery ('assess') only.", err=True)
+    log("    The write path (connectioninfo -> settings -> sitecontainers PUT -> wait for "
+        f"'{SIDECAR_SUCCESS_LOG}' -> LD_PRELOAD + restart -> verify) lands next, with the "
+        "same --what-if / --state-file / --rollback guarantees as the code path.", err=True)
+    raise SystemExit(2)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="dt_appservice_sidecar.py",
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("action", nargs="?", default="assess",
+                   choices=["assess", "deploy", "verify", "uninstall", "update"],
+                   help="assess (container sidecar-readiness, DEFAULT) | deploy/verify/uninstall/update (Phase 2/3)")
+    # scope (reused from the core tool's semantics)
+    p.add_argument("--subscription", "--subscription-filter", dest="subscription",
+                   action="append", metavar="GUID|NAME",
+                   help="subscription GUID or name (substring/glob), repeatable")
+    p.add_argument("--all-subscriptions", action="store_true")
+    p.add_argument("--resource-group")
+    p.add_argument("--app-service-name", "--name-filter", dest="app_service_name",
+                   action="append", metavar="NAME", help="app name (substring/glob), repeatable")
+    # output / client
+    p.add_argument("--output-file")
+    p.add_argument("--format", choices=["txt", "md", "csv", "json"])
+    p.add_argument("--detailed", action="store_true", help="(reserved) deeper per-app probing")
+    p.add_argument("--use-arm", action="store_true", help="inventory via ARM instead of Resource Graph")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--rest", action="store_true", help="ARM REST instead of az CLI (recommended)")
+    p.add_argument("--no-token-cache", action="store_true")
+    p.add_argument("--auth", choices=["auto", "az", "managed-identity", "service-principal"], default="auto")
+    p.add_argument("--creds", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "creds.json"))
+    # sidecar knobs (most consumed in Phase 2; parsed now so the CLI is stable)
+    p.add_argument("--sidecar-name", default=DEFAULT_SIDECAR_NAME)
+    p.add_argument("--technology", help="override the Dynatrace --technology for the bootstrapper")
+    p.add_argument("--technology-map", help="file of 'name-glob: tech' lines overriding the hint")
+    p.add_argument("--network-zone", help="Dynatrace network zone (connectioninfo + DT_NETWORK_ZONE)")
+    p.add_argument("--parallel", type=int, default=1, metavar="N")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--what-if", action="store_true")
+    return p
+
+
+def _load_tech_map(path):
+    if not path:
+        return None
+    m = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            m[k.strip()] = v.strip()
+    return m
+
+
+def main():
+    args = build_parser().parse_args()
+    core.VERBOSE = args.verbose
+    core.USE_REST = args.rest
+    core.NO_TOKEN_CACHE = args.no_token_cache
+    core.AUTH_PREF = args.auth
+
+    if args.action != "assess":
+        _phase2(args.action)
+
+    if args.technology and args.technology not in DT_TECHNOLOGIES:
+        raise SystemExit(f"--technology must be one of: {', '.join(sorted(DT_TECHNOLOGIES))}")
+    tech_map = _load_tech_map(args.technology_map)
+
+    fmt = args.format
+    if not fmt and args.output_file:
+        ext = os.path.splitext(args.output_file)[1].lower().lstrip(".")
+        fmt = {"md": "md", "csv": "csv", "json": "json"}.get(ext, "txt")
+    fmt = fmt or "txt"
+
+    subs = core.resolve_subscriptions(args)
+    records = core.build_app_records(args, subs)
+
+    # container Linux Web Apps only (what the code/core tool skips). Exclude functions.
+    containers = [r for r in records
+                  if r.get("is_linux") and r.get("deploy_model") == "container"
+                  and not r.get("is_function")]
+    log(f"[sidecar] {len(records)} app(s) in scope; {len(containers)} are container Linux "
+        f"Web App(s) (the sidecar path targets these)")
+    if not containers:
+        log("[sidecar] no container apps matched — nothing to assess.")
+        return
+
+    workers = max(1, args.parallel) if core.USE_REST else 1
+    log(f"[sidecar] probing readiness for {len(containers)} app(s)"
+        + (f" across {workers} threads..." if workers > 1 else "..."))
+    if workers > 1:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(lambda a: sidecar_readiness(a, args.sidecar_name, tech_map), containers))
+    else:
+        for a in containers:
+            sidecar_readiness(a, args.sidecar_name, tech_map)
+
+    report = render_sidecar_report(containers, fmt)
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            f.write(report + "\n")
+        log(f"[sidecar] wrote {args.output_file}")
+    else:
+        print("\n" + report)
+
+
+if __name__ == "__main__":
+    main()

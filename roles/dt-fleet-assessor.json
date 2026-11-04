@@ -1,11 +1,15 @@
 {
   "Name": "DT Fleet Assessor (read-only)",
   "IsCustom": true,
-  "Description": "Least-privilege role for `dt_appservice_fleet.py assess` (dry run). Read-only: lists App Services, reads site config + app settings, and queries Resource Graph. Grants NO write or restart permission. Assign to the delegated user who runs assessments — no Service Principal or admin account required.",
+  "Description": "Least-privilege role for `dt_appservice_fleet.py assess` AND `dt_appservice_sidecar.py assess` (dry runs). Read-only: lists App Services, reads site config + app settings, sitecontainers, slots, and the App Service Plan (SKU), and queries Resource Graph. Grants NO write or restart permission. Assign to the delegated user who runs assessments — no Service Principal or admin account required.",
   "Actions": [
     "Microsoft.Web/sites/read",
     "Microsoft.Web/sites/config/read",
     "Microsoft.Web/sites/config/list/action",
+    "Microsoft.Web/sites/sitecontainers/read",
+    "Microsoft.Web/sites/slots/read",
+    "Microsoft.Web/sites/slots/config/list/action",
+    "Microsoft.Web/serverfarms/read",
     "Microsoft.Resources/subscriptions/read",
     "Microsoft.Resources/subscriptions/resourceGroups/read",
     "Microsoft.ResourceGraph/resources/read"
