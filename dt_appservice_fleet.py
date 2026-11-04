@@ -707,6 +707,54 @@ def arm_inventory(subscription_ids, resource_group=None):
     return rows
 
 
+# Infer the OneAgent tech from the startup command when the runtime metadata is
+# missing (some apps have no linuxFxVersion — the stack lives only in the command).
+_STARTUP_TECH = [
+    ("python", ("gunicorn", "uvicorn", "hypercorn", "waitress", "python3", "python ",
+                "flask", "django", "manage.py", "streamlit", "fastapi")),
+    ("nodejs", ("node ", "npm", "pm2", "yarn", "pnpm", "next ", "nuxt", "node_modules/.bin")),
+    ("java", ("java ", "-jar", "catalina", "tomcat", "org.springframework")),
+    ("dotnet", ("dotnet ",)),
+    ("php", ("php ", "php-fpm", "artisan")),
+    ("ruby", ("ruby ", "rails", "puma", "rackup", "bundle exec", "unicorn")),
+]
+
+
+def _infer_dt_include_from_startup(cmd):
+    c = (cmd or "").lower()
+    for inc, keys in _STARTUP_TECH:
+        if any(k in c for k in keys):
+            return inc
+    return ""
+
+
+def _backfill_runtime(app, linux_fx, windows_fx):
+    """Resource Graph sometimes returns a null linuxFxVersion for a Linux code app,
+    leaving the runtime empty. Re-derive it from the per-app config/web fx; if that's
+    also empty, infer the tech from the startup command. Updates the record so the
+    app is no longer wrongly 'no OneAgent mapping'."""
+    if app.get("runtime_family"):
+        return
+    if linux_fx or windows_fx:
+        recls = classify({"kind": app.get("kind", ""), "linuxFx": linux_fx, "windowsFx": windows_fx})
+        for k in ("runtime_family", "runtime_version", "runtime", "registry", "registry_type",
+                  "dt_include", "deploy_model", "is_container", "deployable"):
+            if k in recls:
+                app[k] = recls[k]
+        if app.get("dt_include"):
+            vlog(f"[{app['name']}] runtime backfilled from config: {app.get('runtime')}")
+            return
+    inc = _infer_dt_include_from_startup(app.get("startup_command") or "")
+    if inc:
+        app["dt_include"] = inc
+        if not app.get("runtime"):
+            app["runtime_family"] = inc.upper()
+            app["runtime"] = inc.upper()
+        app["deployable"] = bool(app.get("is_linux") and app.get("deploy_model") == "code")
+        vlog(f"[{app['name']}] runtime inferred from startup command '{app.get('startup_command')}' "
+             f"-> include={inc}")
+
+
 def enrich_startup(app):
     """Fetch the startup command + DT instrumentation state for one app (per-app az call).
 
@@ -726,12 +774,15 @@ def enrich_startup(app):
 def _enrich_startup(app):
     rg, name, sub = app["resource_group"], app["name"], app["subscription_id"]
 
+    linux_fx = windows_fx = None
     if USE_REST:
         # ARM REST: ~30x faster than az here (no per-call CLI module load).
         s = app.get("subscription_id")
         cfg = arm_resource("GET", app["id"], "/config/web", subscription=s)
         cfg_ok = isinstance(cfg, dict) and "properties" in cfg
-        startup = (cfg["properties"].get("appCommandLine") or "") if cfg_ok else ""
+        props = cfg["properties"] if cfg_ok else {}
+        startup = (props.get("appCommandLine") or "") if cfg_ok else ""
+        linux_fx, windows_fx = props.get("linuxFxVersion"), props.get("windowsFxVersion")
         app["startup_command"] = startup if cfg_ok else None
 
         setres = arm_resource("POST", app["id"], "/config/appsettings/list", subscription=s)
@@ -747,6 +798,8 @@ def _enrich_startup(app):
         ], check=False, timeout=300)
         cfg_ok = isinstance(cfg, dict)
         startup = (cfg.get("appCommandLine") or "") if cfg_ok else ""
+        if cfg_ok:
+            linux_fx, windows_fx = cfg.get("linuxFxVersion"), cfg.get("windowsFxVersion")
         app["startup_command"] = startup if cfg_ok else None
 
         # App settings: NOTE `appsettings list` does NOT accept --ids — it requires
@@ -766,6 +819,10 @@ def _enrich_startup(app):
         app["dt_instrumented"] = None
         app["enrich_error"] = "az config/appsettings reads failed (likely timeout)"
         return app
+
+    # Graph sometimes omits linuxFxVersion -> empty runtime -> wrongly "no OneAgent
+    # mapping". Backfill from the config we just fetched (and the startup command).
+    _backfill_runtime(app, linux_fx, windows_fx)
 
     app["dt_instrumented"] = (
         any(k in names for k in ("DT_ENDPOINT", "DT_API_TOKEN", "DT_TENANT"))
@@ -1210,6 +1267,58 @@ def deployable_reason(app):
     return None
 
 
+def discover_start_cmd(app):
+    """Best-effort: derive the launch command for an app that has NO startup command
+    (relies on Oryx's implicit default), by inspecting its deployed files via Kudu —
+    i.e. replicate what Oryx auto-detects. Returns (cmd, note); cmd='' if undetermined.
+    Opt-in (--discover-start-cmd) because a wrong command would crash the app."""
+    inc = app.get("dt_include")
+    root = "site/wwwroot"
+
+    def _ls():
+        raw = kudu_get(app, f"{root}/")
+        try:
+            return [x.get("name", "") for x in json.loads(raw or "[]") if isinstance(x, dict)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _read(path):
+        return kudu_get(app, f"{root}/{path}")
+
+    if inc == "nodejs":
+        pkg = _read("package.json")
+        if pkg:
+            try:
+                d = json.loads(pkg)
+                if (d.get("scripts") or {}).get("start"):
+                    return "npm start", "package.json start script"
+                if d.get("main"):
+                    return f"node {d['main']}", "package.json main"
+            except Exception:  # noqa: BLE001
+                pass
+        names = _ls()
+        for f in ("server.js", "app.js", "index.js"):
+            if f in names:
+                return f"node {f}", f"found {f}"
+        return "", "no Node entrypoint found (package.json / server.js / app.js)"
+
+    if inc == "python":
+        names = _ls()
+        if "manage.py" in names:
+            return "", "Django (manage.py) — pass --start-app-cmd 'gunicorn <project>.wsgi' explicitly"
+        reqs = (_read("requirements.txt") or "").lower()
+        asgi = any(k in reqs for k in ("fastapi", "uvicorn", "starlette", "quart"))
+        for stem in ("application", "app", "main", "server", "run", "index", "wsgi"):
+            if f"{stem}.py" in names:
+                if asgi:
+                    return (f"gunicorn -k uvicorn.workers.UvicornWorker --bind=0.0.0.0:8000 {stem}:app",
+                            f"ASGI ({stem}.py + uvicorn/fastapi in requirements)")
+                return f"gunicorn --bind=0.0.0.0:8000 {stem}:app", f"WSGI ({stem}.py)"
+        return "", "no Python entrypoint found (app.py / application.py / main.py)"
+
+    return "", f"no discovery for runtime '{inc}'"
+
+
 def deploy_one(app, creds, args):
     name, rg = app["name"], app["resource_group"]
     sub = app["subscription_id"]
@@ -1230,31 +1339,37 @@ def deploy_one(app, creds, args):
     existing = (app.get("startup_command") or "").strip()
     app_settings = app.get("app_settings", {}) or {}
     prior_start = app_settings.get("START_APP_CMD")
+    start_cmd = None
     if existing and not _looks_instrumented(existing):
         start_cmd = existing
     elif args.start_app_cmd:
         start_cmd = args.start_app_cmd
     elif prior_start:
         start_cmd = prior_start
-    else:
-        defaults = {
-            "nodejs": "",            # no safe universal default — must be explicit
-            "python": "",
-            "dotnet": "",
-            "java": "",
-        }
-        start_cmd = defaults.get(app["dt_include"], "")
-        if not start_cmd:
+    elif getattr(args, "discover_start_cmd", False) and not _looks_instrumented(existing):
+        cmd, note = discover_start_cmd(app)
+        if cmd:
+            start_cmd = cmd
+            log(f"    [{name}] discovered START_APP_CMD: '{cmd}'  ({note}) — review with --what-if")
+        else:
             result["status"] = "needs-input"
-            if _looks_instrumented(existing):
-                result["detail"] = ("already has an installer wrapper as its startup "
-                                     "command but no captured START_APP_CMD (foreign "
-                                     "instrumentation); pass --start-app-cmd with the "
-                                     "real launch command to adopt it safely")
-            else:
-                result["detail"] = ("no existing Startup Command and none provided; "
-                                     "pass --start-app-cmd (app relied on implicit default)")
+            result["detail"] = f"could not discover startup command ({note}); pass --start-app-cmd"
             return result
+    if start_cmd is None:
+        result["status"] = "needs-input"
+        if _looks_instrumented(existing):
+            result["detail"] = ("already has an installer wrapper as its startup command but no "
+                                 "captured START_APP_CMD (foreign instrumentation); pass "
+                                 "--start-app-cmd with the real launch command to adopt it safely")
+        else:
+            example = {"python": "gunicorn --bind=0.0.0.0:8000 app:app",
+                       "nodejs": "npm start   (or: node server.js)",
+                       "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
+            result["detail"] = ("no Startup Command (relies on Oryx's implicit default start). "
+                                 "Pass --start-app-cmd, or --discover-start-cmd to auto-detect from the "
+                                 "app's files"
+                                 + (f". e.g. --start-app-cmd '{example}'" if example else ""))
+        return result
 
     include = args.dt_include or app["dt_include"]
     flavor = args.dt_flavor
@@ -1717,6 +1832,10 @@ def main():
     p.add_argument("--dt-include", help="override DT_INCLUDE (else inferred per runtime)")
     p.add_argument("--dt-flavor", default="default", help="DT_FLAVOR (default=glibc, musl for Alpine)")
     p.add_argument("--start-app-cmd", help="explicit START_APP_CMD for apps with no existing startup command")
+    p.add_argument("--discover-start-cmd", action="store_true",
+                   help="for apps with no startup command (Oryx implicit default), auto-detect the launch "
+                        "command from the app's files via Kudu (package.json / Python entrypoint). "
+                        "Best-effort — review with --what-if first (a wrong command would crash the app).")
     p.add_argument("--env-tag", default="demo", help="value for DT_TAGS env=")
     p.add_argument("--service-name", help="OTEL_SERVICE_NAME for the Dynatrace service entity; supports {name}/{rg}/{sub} placeholders (default: the app's site name)")
     p.add_argument("--otel-resource-attributes", help="OTEL_RESOURCE_ATTRIBUTES, e.g. 'service.namespace=retail,deployment.environment=prod'")

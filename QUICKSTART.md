@@ -99,7 +99,8 @@ python3 dt_appservice_fleet.py uninstall \
 | `--parallel N` | deploy/uninstall N apps at once (~sequential-time/N; overlaps restart-wait). Keep low on `az`; `--rest` handles more. |
 | `--force` | re-apply to already-instrumented apps (default skips them) |
 | `-v` / `--verbose` | echo every call + timing (tokens redacted) — **use if it looks stuck** |
-| `--start-app-cmd "<cmd>"` | required only for apps with **no** existing startup command |
+| `--start-app-cmd "<cmd>"` | launch command for apps with **no** startup command (Oryx implicit default) |
+| `--discover-start-cmd` | auto-detect that launch command from the app's files (package.json / Python entrypoint) — review with `--what-if` |
 | `--set-host-tag K=V` | extra Dynatrace `[Environment]K:V` tag (repeatable) |
 | `--detailed` | assess: fetch per-app startup cmd + DT state |
 
