@@ -1274,18 +1274,27 @@ def discover_start_cmd(app):
     Opt-in (--discover-start-cmd) because a wrong command would crash the app."""
     inc = app.get("dt_include")
     root = "site/wwwroot"
+    unreachable = [False]
 
     def _ls():
         raw = kudu_get(app, f"{root}/")
+        if raw is None:
+            unreachable[0] = True
+            return []
         try:
-            return [x.get("name", "") for x in json.loads(raw or "[]") if isinstance(x, dict)]
+            return [x.get("name", "") for x in json.loads(raw) if isinstance(x, dict)]
         except Exception:  # noqa: BLE001
             return []
 
     def _read(path):
         return kudu_get(app, f"{root}/{path}")
 
+    _UNREACH = "could not read app files (SCM/Kudu unreachable) — pass --start-app-cmd explicitly"
+
     if inc == "nodejs":
+        names = _ls()
+        if unreachable[0]:
+            return "", _UNREACH
         pkg = _read("package.json")
         if pkg:
             try:
@@ -1296,7 +1305,6 @@ def discover_start_cmd(app):
                     return f"node {d['main']}", "package.json main"
             except Exception:  # noqa: BLE001
                 pass
-        names = _ls()
         for f in ("server.js", "app.js", "index.js"):
             if f in names:
                 return f"node {f}", f"found {f}"
@@ -1304,6 +1312,8 @@ def discover_start_cmd(app):
 
     if inc == "python":
         names = _ls()
+        if unreachable[0]:
+            return "", _UNREACH
         if "manage.py" in names:
             return "", "Django (manage.py) — pass --start-app-cmd 'gunicorn <project>.wsgi' explicitly"
         reqs = (_read("requirements.txt") or "").lower()
@@ -1362,13 +1372,21 @@ def deploy_one(app, creds, args):
                                  "captured START_APP_CMD (foreign instrumentation); pass "
                                  "--start-app-cmd with the real launch command to adopt it safely")
         else:
-            example = {"python": "gunicorn --bind=0.0.0.0:8000 app:app",
-                       "nodejs": "npm start   (or: node server.js)",
-                       "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
-            result["detail"] = ("no Startup Command (relies on Oryx's implicit default start). "
-                                 "Pass --start-app-cmd, or --discover-start-cmd to auto-detect from the "
-                                 "app's files"
-                                 + (f". e.g. --start-app-cmd '{example}'" if example else ""))
+            # Run discovery read-only so the message can show the detected command.
+            suggestion, note = discover_start_cmd(app)
+            if suggestion:
+                result["detail"] = (f"no Startup Command (Oryx implicit default). Detected likely: "
+                                     f"'{suggestion}' ({note}) — re-run with --discover-start-cmd to "
+                                     f"apply it, or --start-app-cmd to set it explicitly.")
+            else:
+                example = {"python": "gunicorn --bind=0.0.0.0:8000 app:app",
+                           "nodejs": "npm start   (or: node server.js)",
+                           "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
+                result["detail"] = ("no Startup Command (Oryx implicit default); "
+                                     + (f"{note}. " if note else "")
+                                     + "pass --start-app-cmd"
+                                     + (f" (e.g. '{example}')" if example else "")
+                                     + " or --discover-start-cmd.")
         return result
 
     include = args.dt_include or app["dt_include"]
