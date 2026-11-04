@@ -76,6 +76,23 @@ python3 dt_appservice_fleet.py verify --auth az --subscription <sub> \
     --app-service-name "<app>" --rest --dt-timeout 300
 ```
 
+## 3c. Apps with no Startup Command (Oryx implicit default)
+
+Many Linux apps leave the **Startup Command blank** and let the platform's Oryx
+build system auto-detect the launch command at boot. The wrapper has to `exec` a
+real command, so you have two options — pick by what access you have:
+
+| Situation | Use |
+|---|---|
+| You know the command | `--start-app-cmd "gunicorn … app:app"` (one value applies to the whole run) |
+| SCM/Kudu reachable | `--discover-start-cmd` — reads the app's files and replicates Oryx |
+
+**SCM locked down and you don't know the command?** The real launch is printed in the
+**Azure Portal → Log stream** at boot (`Generating 'gunicorn' command for '<module>:app'`
+for Python, the `pm2`/`node` line for Node) — copy that into `--start-app-cmd`. If an app
+shows `No framework detected; using default app`, it has **no code deployed** — instrument
+it once your application is actually deployed.
+
 ## 4. Uninstall (revert)
 
 ```bash

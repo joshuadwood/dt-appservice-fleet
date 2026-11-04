@@ -105,6 +105,18 @@ Useful knobs: `--dt-include` (override the per-runtime tech), `--dt-flavor`
 `-v/--verbose` (echo every `az` call with timing + applied values, tokens redacted),
 `--rest` (ARM REST fast path for reads).
 
+**Apps with no Startup Command (Oryx implicit default).** The wrapper must `exec` a
+real launch command. Two ways to supply it:
+
+- `--start-app-cmd "<cmd>"` — you provide it (one value applies to the whole run).
+- `--discover-start-cmd` — read the app's files via Kudu and replicate Oryx's logic
+  (needs SCM/Kudu reachable).
+
+When SCM is IP-restricted and the command is unknown, the real launch is printed in the
+**Azure Portal → Log stream** at boot (`Generating 'gunicorn' command for '<module>:app'`)
+— copy it into `--start-app-cmd`. An app logging `No framework detected; using default
+app` has *no code deployed*; instrument it once the application is actually there.
+
 ### Naming & tagging in Dynatrace
 
 Every deploy stamps a reliable identity **tag** via `DT_TAGS`, which surfaces in
