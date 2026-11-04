@@ -1374,19 +1374,22 @@ def deploy_one(app, creds, args):
         else:
             # Run discovery read-only so the message can show the detected command.
             suggestion, note = discover_start_cmd(app)
+            example = {"python": "gunicorn --bind=0.0.0.0:8000 app:app",
+                       "nodejs": "npm start   (or: node server.js)",
+                       "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
+            eg = f" (e.g. '{example}')" if example else ""
             if suggestion:
-                result["detail"] = (f"no Startup Command (Oryx implicit default). Detected likely: "
-                                     f"'{suggestion}' ({note}) — re-run with --discover-start-cmd to "
-                                     f"apply it, or --start-app-cmd to set it explicitly.")
+                result["detail"] = (f"no Startup Command (Oryx default). Detected likely: '{suggestion}' "
+                                     f"({note}) — re-run with --discover-start-cmd to apply, or "
+                                     f"--start-app-cmd to set it explicitly.")
+            elif "unreachable" in (note or "").lower():
+                result["detail"] = (f"no Startup Command (Oryx default) and SCM/Kudu is IP-restricted, "
+                                     f"so auto-detect can't read the files. Pass --start-app-cmd{eg}, "
+                                     f"or run the tool from an SCM-allowed host/IP to use "
+                                     f"--discover-start-cmd.")
             else:
-                example = {"python": "gunicorn --bind=0.0.0.0:8000 app:app",
-                           "nodejs": "npm start   (or: node server.js)",
-                           "java": "java -jar app.jar", "dotnet": "dotnet app.dll"}.get(app.get("dt_include"), "")
-                result["detail"] = ("no Startup Command (Oryx implicit default); "
-                                     + (f"{note}. " if note else "")
-                                     + "pass --start-app-cmd"
-                                     + (f" (e.g. '{example}')" if example else "")
-                                     + " or --discover-start-cmd.")
+                result["detail"] = (f"no Startup Command (Oryx default){'; ' + note if note else ''}. "
+                                     f"Pass --start-app-cmd{eg} or --discover-start-cmd.")
         return result
 
     include = args.dt_include or app["dt_include"]
