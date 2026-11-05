@@ -15,8 +15,10 @@ Credentials (`dtApiEnvUrl`, `dtPaasToken`) are read from `creds.json`.
 
 | File | Purpose |
 |---|---|
-| `dt_appservice_fleet.py` | **Main tool.** `assess` (dry run) / `deploy` / `verify` / `uninstall` across subscriptions. |
+| `dt_appservice_fleet.py` | **Main tool (code path).** `assess` / `deploy` / `verify` / `uninstall` for Linux **code/built-in-image** apps, across subscriptions. |
+| `dt_appservice_sidecar.py` | **Sidecar path (containers).** `assess` / `deploy` / `verify` / `uninstall` / `update` for **containerized (BYOC)** Linux apps via the bootstrapper sidecar. See [Container apps (sidecar path)](#container-apps-sidecar-path). |
 | `provision_demo_apps.sh` | Stand up 4 demo App Services (2 Python, 2 Node — distinct frameworks). |
+| `provision_demo_containers.sh` | Stand up demo **container** Web Apps (sitecontainers + legacy DOCKER\| modes) for the sidecar path. |
 | `generate_load.py` | Drive CRUD traffic against the apps so OneAgent has requests to trace. |
 | `apps/` | Source for the 4 demo apps (Express, Fastify, Flask, FastAPI). |
 | `reports/` | Generated assessment reports (`.md` / `.json` / `.csv`). |
@@ -334,6 +336,87 @@ Then the app is **restarted twice** (once to install, once to instrument).
 6. **Ephemeral `/opt/dynatrace`.** The agent lives in the container filesystem and
    is re-downloaded on every cold start — acceptable for the built-in path; noted
    as the known coupling (gotchas §10).
+
+---
+
+## Container apps (sidecar path)
+
+`dt_appservice_fleet.py` instruments Linux **code/built-in-image** apps. The apps it
+inventories and *skips* — **containerized (bring-your-own-container) Linux Web Apps** —
+are handled by a separate, independent fork, **`dt_appservice_sidecar.py`**, which
+attaches the Dynatrace **`dynatrace-codemodules` bootstrapper as a sidecar container**
+(per the [Dynatrace doc](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/integrations/azure-appservice/integrate-oneagent-on-web-app-for-containers)).
+A given app is instrumented by exactly one path, never both.
+
+### The two paths at a glance
+
+| | Code path (`dt_appservice_fleet.py`) | Sidecar path (`dt_appservice_sidecar.py`) |
+|---|---|---|
+| Targets | Linux built-in image / code apps | Linux container (BYOC) apps (`sitecontainers`, legacy `DOCKER\|`) |
+| Agent delivery | PaaS installer downloaded in a startup-command wrapper | `dynatrace-codemodules` **sidecar** writes the agent to `/home` |
+| `LD_PRELOAD` | set **inline** in the startup command (not an app setting) | set as an **app setting** (can't touch the customer image's entrypoint) |
+| Token | PaaS token (installer) | **tenant token** (NOT PaaS — PaaS token here fails) + connection endpoints |
+| Restarts | 2 (install, instrument) | 2 (bootstrap-settle, instrument) |
+| Updates | re-run `deploy` (re-downloads) | `update` → new sidecar image tag |
+| Uninstall | restores original startup command | deletes sidecar + settings; agent files remain under `/home` |
+
+### Usage
+
+```bash
+# 1) assess — per-container-app readiness (never mutates)
+python3 dt_appservice_sidecar.py assess --all-subscriptions --rest
+
+# 2) deploy — sitecontainers-mode apps, with inline verify + auto-rollback
+python3 dt_appservice_sidecar.py deploy --subscription prod \
+    --rest --yes --verify --rollback-on-fail
+
+# 3) verify / uninstall / update
+python3 dt_appservice_sidecar.py verify    --subscription prod --rest
+python3 dt_appservice_sidecar.py uninstall --subscription prod --rest --yes
+python3 dt_appservice_sidecar.py update    --subscription prod --rest --yes   # newest codemodules tag
+```
+
+Readiness statuses: **sidecar-ready** · **needs-conversion** (legacy `DOCKER|` → pass
+`--allow-convert`) · **needs-storage** (pass `--enable-storage`) · **needs-review**
+(Alpine/musl — pass `--allow-alpine`) · **needs-input** (foreign `LD_PRELOAD`) ·
+**unsupported-runtime** (Python → OTel path, skipped) / **-compose** / **-sku** ·
+**instrumented**.
+
+### Key flags
+
+| Flag | Effect |
+|---|---|
+| `--oneagent-version <tag>` | pin the codemodules image (default: newest from Docker Hub; `latest` refused) |
+| `--technology <t>` / `--technology-map <file>` | bootstrapper `--technology=` (java/dotnet/nodejs/php/go/apache/nginx). A specific value is **much faster** than the `all` default |
+| `--image-registry <host/path>` / `--registry-auth` | pull the sidecar from a mirror (ACR) — recommended for fleets (Docker Hub anon pull is 100/6h/IP) |
+| `--enable-storage` | flip `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` (required; bootstrapper skips silently without it) |
+| `--allow-convert` / `--revert-conversion` | convert legacy `DOCKER|` → `sitecontainers` (forces `--parallel 1`) / restore it on uninstall |
+| `--disable-app-insights` | remove conflicting App Insights auto-instrumentation (stashed for uninstall) |
+| `--rollback-on-fail` | with `--verify`: uninstall any app not serving HTTP after deploy (independent of the agent verdict) |
+| `--sidecar-wait <s>` | max wait for the agent to land on `/home` (the tool **polls** and proceeds as soon as it appears) |
+| `--include-slots` · `--keyvault-ref <vault>` · `--prune-old-versions` | apply to slots · store the tenant token as a Key Vault reference · delete stale agent versions |
+
+### Hard edges (customer-facing)
+
+- **Tenant token ≠ PaaS token** — the #1 silent failure. The tool derives the tenant
+  token + endpoints from the PaaS token via the connectioninfo API automatically.
+- **Shared storage is load-bearing**: `LD_PRELOAD` loads the `.so` from an SMB mount on
+  every spawn; cold-start latency and Azure Files availability become dependencies.
+- **Supported runtime matters**: the agent injects + connects but will *decline* an
+  unsupported runtime (e.g. it refuses .NET 11), so instrument images on a supported
+  stack. The agent's own log (`/home/dynatrace/oneagent/active/log/<tech>/ruxitagent_*`)
+  tells "declined" from "never loaded".
+- **No auto agent updates** on this path — every bump is an `update` (image-tag change);
+  old versions accumulate under `/home/dynatrace` (`--prune-old-versions`).
+- **App Insights** auto-instrumentation must be *off*, not merely unconfigured.
+- **VNet-integrated apps** need egress to the image registry and `DT_CONNECTION_POINT`.
+- **Python containers** are out of scope (OTel path, not implemented here).
+
+### Least privilege
+
+`roles/dt-fleet-assessor.json` already includes the read permissions the sidecar `assess`
+needs (sitecontainers / slots / serverfarms read). The write path additionally needs
+`Microsoft.Web/sites/sitecontainers/write` + `.../delete` (deploy role).
 
 ---
 

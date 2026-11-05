@@ -136,6 +136,32 @@ python3 dt_appservice_fleet.py uninstall \
 | `--set-host-tag K=V` | extra Dynatrace `[Environment]K:V` tag (repeatable) |
 | `--detailed` | assess: fetch per-app startup cmd + DT state |
 
+## Container apps? Use the sidecar path
+
+The commands above are for **code / built-in-image** apps. **Containerized (BYOC)** Linux
+apps are handled by the independent fork `dt_appservice_sidecar.py`, which attaches the
+Dynatrace bootstrapper as a **sidecar container** (tenant token + `LD_PRELOAD` app
+setting; no image change). Same creds.json.
+
+```bash
+# assess container readiness (never mutates)
+python3 dt_appservice_sidecar.py assess --all-subscriptions --rest
+
+# deploy to sitecontainers-mode apps, confirm + auto-rollback if an app won't serve
+python3 dt_appservice_sidecar.py deploy --subscription prod --rest --yes --verify --rollback-on-fail
+
+# convert a legacy DOCKER| app first, drop App Insights, enable storage, pick the runtime
+python3 dt_appservice_sidecar.py deploy --subscription prod --rest --yes \
+    --allow-convert --enable-storage --disable-app-insights --technology java --verify --rollback-on-fail
+
+# bump the agent / remove it
+python3 dt_appservice_sidecar.py update    --subscription prod --rest --yes
+python3 dt_appservice_sidecar.py uninstall --subscription prod --rest --yes
+```
+**Gotcha #1: tenant token ≠ PaaS token** (the tool derives it for you). Python containers
+are reported `unsupported-runtime` and skipped. Full detail + the two-paths comparison:
+[README → Container apps (sidecar path)](README.md#container-apps-sidecar-path).
+
 ## Naming / tagging in Dynatrace
 
 Every deploy auto-stamps `azure.app_service_name=<site>` → shows as
