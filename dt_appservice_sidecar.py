@@ -446,14 +446,43 @@ def _gate(app, args):
     return None, None
 
 
+def _agent_laid_down(app):
+    """True if the bootstrapper has written liboneagentproc.so to the shared mount, False
+    if not yet, None if the mount is unreadable (SCM IP-restricted). Checks the lib64 dir
+    listing (light) rather than downloading the .so."""
+    raw = core.kudu_get(app, "dynatrace/oneagent/active/agent/lib64/")
+    if raw is None:
+        return False if core.kudu_get(app, "") is not None else None
+    try:
+        return any(x.get("name") == "liboneagentproc.so" for x in json.loads(raw))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _wait_sidecar(app, args):
-    """Wait for the bootstrapper to finish. v1: fixed wait (SCM/Kudu log polling is a
-    follow-on); verify() is the real confirmation. Returns None (unconfirmed)."""
-    if args.parallel > 1:
+    """Wait until the bootstrapper has actually laid down the agent on /home (not a blind
+    sleep — the download to SMB-mounted /home can far exceed a fixed guess, and restarting
+    before it finishes leaves the app un-instrumented). Polls the shared mount up to
+    --sidecar-wait; falls back to a blind sleep only when SCM/Kudu is unreachable.
+    Returns True (agent present), False (timed out), or None (couldn't check)."""
+    name = app["name"]
+    if _agent_laid_down(app) is None:   # SCM blocked -> can't poll, sleep blind
+        log(f"    [{name}] (SCM unreadable — waiting {args.sidecar_wait}s blind, verify will confirm)")
         time.sleep(args.sidecar_wait)
-    else:
-        core.sleep_with_heartbeat(args.sidecar_wait, f"[{app['name']}] sidecar bootstrap")
-    return None
+        return None
+    deadline = args.sidecar_wait
+    waited = 0
+    while waited < deadline:
+        if _agent_laid_down(app) is True:
+            log(f"    [{name}] agent laid down after ~{waited}s")
+            return True
+        step = min(15, deadline - waited)
+        time.sleep(step)
+        waited += step
+    log(f"    [{name}] WARNING: agent not yet on /home after {deadline}s "
+        f"(bootstrapper slow — try a larger --sidecar-wait or a specific --technology); "
+        f"verify will tell the truth", err=True)
+    return False
 
 
 def sidecar_deploy_one(app, creds, conn, args):
