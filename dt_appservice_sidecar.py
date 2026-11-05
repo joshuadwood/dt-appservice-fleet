@@ -437,8 +437,8 @@ def _gate(app, args):
         return "needs-input", reason
     if status == "instrumented" and not args.force:
         return "skipped", "already has a Dynatrace sidecar (use --force to re-apply)"
-    if status == "needs-conversion":
-        return "needs-conversion", "legacy DOCKER| container — conversion to sitecontainers is Phase 3 (--allow-convert)"
+    if status == "needs-conversion" and not getattr(args, "allow_convert", False):
+        return "needs-conversion", "legacy DOCKER| container — pass --allow-convert to convert to sitecontainers"
     if status == "needs-storage" and not args.enable_storage:
         return "needs-storage", "WEBSITES_ENABLE_APP_SERVICE_STORAGE is not true — pass --enable-storage"
     if status == "needs-review" and not args.allow_alpine:
@@ -490,6 +490,19 @@ def sidecar_deploy_one(app, creds, conn, args):
     r = app.get("sidecar", {})
     result = {"name": name, "rg": rg, "status": "", "detail": ""}
 
+    # Legacy DOCKER| conversion (Phase 3): with --allow-convert, convert to sitecontainers
+    # first, then re-read readiness so the normal flow continues. Without it, _gate blocks.
+    if app.get("sidecar_status") == "needs-conversion" and getattr(args, "allow_convert", False) \
+            and not args.what_if:
+        try:
+            convert_legacy_to_sitecontainers(app, args)
+            sidecar_readiness(app, args.sidecar_name)   # re-classify post-conversion
+            r = app.get("sidecar", {})
+        except Exception as e:  # noqa: BLE001
+            result["status"] = "error"
+            result["detail"] = f"conversion failed: {redact(str(e))}"
+            return result
+
     blocked, detail = _gate(app, args)
     if blocked:
         result["status"], result["detail"] = blocked, detail
@@ -503,6 +516,8 @@ def sidecar_deploy_one(app, creds, conn, args):
 
     if args.what_if:
         acts = []
+        if status == "needs-conversion" and getattr(args, "allow_convert", False):
+            acts.append(f"CONVERT legacy DOCKER| -> sitecontainers (main={r.get('main_image','?')})")
         if status == "needs-storage":
             acts.append("set WEBSITES_ENABLE_APP_SERVICE_STORAGE=true")
         if args.disable_app_insights and r.get("app_insights"):
@@ -624,16 +639,131 @@ def sidecar_uninstall_one(app, args):
             except Exception:  # noqa: BLE001
                 pass
             remove.append("DT_FLEET_ORIG_APPINSIGHTS")
+        # optional: revert a sitecontainers conversion back to the original DOCKER| mode
+        reverted = ""
+        if getattr(args, "revert_conversion", False) and settings.get("DT_FLEET_ORIG_LINUXFX"):
+            orig_fx = settings["DT_FLEET_ORIG_LINUXFX"]
+            log(f"    [{name}] reverting conversion -> linuxFxVersion='{orig_fx}'...")
+            core.arm_resource("PATCH", app["id"], "/config/web",
+                              body={"properties": {"linuxFxVersion": orig_fx,
+                                                   "appCommandLine": settings.get("DT_FLEET_ORIG_STARTUP", "")}},
+                              subscription=app["subscription_id"])
+            remove += ["DT_FLEET_ORIG_LINUXFX", "DT_FLEET_ORIG_STARTUP"]
+            reverted = f"; reverted to {orig_fx}"
         log(f"    [{name}] 2/4 removing {len(remove)} setting(s)"
             + (f", restoring {len(restore)}" if restore else "") + "...")
         core.arm_delete_appsettings(app, remove)
         if restore:
             core.arm_set_appsettings(app, restore)
+        app["_revert_note"] = reverted
         log(f"    [{name}] 3/4 restart...")
         core.arm_restart(app)
         log(f"    [{name}] 4/4 done (note: /home/dynatrace agent files remain on shared storage)")
         result["status"] = "uninstalled"
-        result["detail"] = f"removed sidecar + {len(remove)} setting(s)"
+        result["detail"] = f"removed sidecar + {len(remove)} setting(s){app.get('_revert_note','')}"
+    except Exception as e:  # noqa: BLE001
+        result["status"] = "error"
+        result["detail"] = redact(str(e))
+    return result
+
+
+# =========================================================================== Phase 3
+# Legacy DOCKER| -> sitecontainers conversion, and the `update` action. Conversion is the
+# riskiest operation here: require --allow-convert AND --yes, force --parallel 1, and
+# stash originals so --revert-conversion can restore the DOCKER| app.
+
+def _wait_app_healthy(app, timeout=120):
+    for _ in range(max(1, timeout // 10)):
+        if core.app_http_ok(app, tries=1, delay=0):
+            return True
+        time.sleep(10)
+    return core.app_http_ok(app, tries=1, delay=0)
+
+
+def convert_legacy_to_sitecontainers(app, args):
+    """Turn a legacy `linuxFxVersion=DOCKER|<img>` app into sitecontainers mode (main
+    container PUT + linuxFxVersion flip) so a sidecar can attach. Stashes the original
+    linuxFxVersion + appCommandLine for --revert-conversion. Raises on failure."""
+    s = app["subscription_id"]
+    name = app["name"]
+    settings = app.get("app_settings", {}) or {}
+    cfg = core.arm_resource("GET", app["id"], "/config/web", subscription=s)
+    cp = cfg.get("properties", {}) if isinstance(cfg, dict) else {}
+    linux_fx = cp.get("linuxFxVersion", "") or ""
+    startup = cp.get("appCommandLine", "") or ""
+    image = linux_fx.split("|", 1)[1] if "|" in linux_fx else app.get("sidecar", {}).get("main_image", "")
+    if not image:
+        raise RuntimeError("could not determine the container image to convert")
+    port = settings.get("WEBSITES_PORT") or "80"
+
+    props = {"image": image, "isMain": True, "targetPort": str(port)}
+    if startup:
+        props["startUpCommand"] = startup
+    user = settings.get("DOCKER_REGISTRY_SERVER_USERNAME")
+    pwd = settings.get("DOCKER_REGISTRY_SERVER_PASSWORD")
+    acr_mi = str(cp.get("acrUseManagedIdentityCreds", "")).lower() == "true"
+    acr_id = cp.get("acrUserManagedIdentityId") or ""
+    if user and pwd:
+        props.update(authType="UserCredentials", userName=user, passwordSecret=pwd)
+    elif acr_mi and acr_id:
+        props.update(authType="UserAssigned", userManagedIdentityClientId=acr_id)
+    elif acr_mi:
+        props["authType"] = "SystemIdentity"
+    else:
+        props["authType"] = "Anonymous"
+
+    stash = {}
+    if "DT_FLEET_ORIG_LINUXFX" not in settings:
+        stash["DT_FLEET_ORIG_LINUXFX"] = linux_fx
+    if "DT_FLEET_ORIG_STARTUP" not in settings:
+        stash["DT_FLEET_ORIG_STARTUP"] = startup
+    if stash:
+        core.arm_set_appsettings(app, stash)
+    log(f"    [{name}] convert: PUT main sitecontainer ({image} :{port} auth={props['authType']})...")
+    if _sc_call("PUT", app, "/sitecontainers/main", {"properties": props}) is None:
+        raise RuntimeError("main sitecontainer PUT failed")
+    log(f"    [{name}] convert: flip linuxFxVersion DOCKER| -> sitecontainers...")
+    if core.arm_resource("PATCH", app["id"], "/config/web",
+                         body={"properties": {"linuxFxVersion": "sitecontainers"}},
+                         subscription=s) is None:
+        raise RuntimeError("linuxFxVersion flip failed")
+    log(f"    [{name}] convert: waiting for the app to come back healthy...")
+    _wait_app_healthy(app, 120)
+
+
+def sidecar_update_one(app, args):
+    name, rg = app["name"], app["resource_group"]
+    result = {"name": name, "rg": rg, "status": "", "detail": ""}
+    sidecar_readiness(app, args.sidecar_name)
+    r = app["sidecar"]
+    if not r.get("dt_instrumented"):
+        result["status"] = "skipped"
+        result["detail"] = "no Dynatrace sidecar present (nothing to update)"
+        return result
+    old = r.get("dt_version", "")
+    new = args._resolved_version
+    if old == new and not args.force:
+        result["status"] = "skipped"
+        result["detail"] = f"already at {new}"
+        return result
+    if args.what_if:
+        result["status"] = "would-update"
+        result["detail"] = f"{old} -> {new}"
+        return result
+    try:
+        tech = _effective_tech(app, args)
+        props = {"image": _sidecar_image(new, args.image_registry), "isMain": False,
+                 "startUpCommand": _sidecar_startup(tech)}
+        props.update(_registry_auth_props(args))
+        log(f"    [{name}] update sidecar {old} -> {new}...")
+        if _sc_call("PUT", app, f"/sitecontainers/{args.sidecar_name}", {"properties": props}) is None:
+            raise RuntimeError("sitecontainers PUT failed")
+        log(f"    [{name}] waiting for the new agent to land (up to {args.sidecar_wait}s)...")
+        _wait_sidecar(app, args)
+        core.arm_restart(app)
+        core.arm_set_appsettings(app, {"DT_FLEET_SIDECAR_VERSION": new})
+        result["status"] = "updated"
+        result["detail"] = f"{old} -> {new} (old versions remain under /home/dynatrace)"
     except Exception as e:  # noqa: BLE001
         result["status"] = "error"
         result["detail"] = redact(str(e))
@@ -681,7 +811,8 @@ def build_parser():
     p.add_argument("--enable-storage", action="store_true", help="permit flipping WEBSITES_ENABLE_APP_SERVICE_STORAGE=true")
     p.add_argument("--allow-alpine", action="store_true", help="proceed on Alpine/musl images (musl support unverified)")
     p.add_argument("--disable-app-insights", action="store_true", help="remove conflicting App Insights settings (stashed for uninstall)")
-    p.add_argument("--allow-convert", action="store_true", help="(Phase 3) permit converting legacy DOCKER| apps to sitecontainers")
+    p.add_argument("--allow-convert", action="store_true", help="permit converting legacy DOCKER| apps to sitecontainers (forces --parallel 1)")
+    p.add_argument("--revert-conversion", action="store_true", help="uninstall: also restore a converted app back to its original DOCKER| mode")
     p.add_argument("--include-slots", action="store_true", help="(Phase 3) also apply to deployment slots")
     # deploy/verify controls
     p.add_argument("--force", action="store_true", help="re-apply to apps already carrying a Dynatrace sidecar")
@@ -721,13 +852,10 @@ def main():
     core.NO_TOKEN_CACHE = args.no_token_cache
     core.AUTH_PREF = args.auth
 
-    if args.action == "update":
-        _phase2("update")  # Phase 3
-
     if args.technology and args.technology not in DT_TECHNOLOGIES:
         raise SystemExit(f"--technology must be one of: {', '.join(sorted(DT_TECHNOLOGIES))}")
     tech_map = _load_tech_map(args.technology_map)
-    mutate = args.action in ("deploy", "uninstall")
+    mutate = args.action in ("deploy", "uninstall", "update")
 
     fmt = args.format
     if not fmt and args.output_file:
@@ -739,10 +867,15 @@ def main():
     creds = conn = None
     if args.action in ("deploy", "verify"):
         creds = core.load_creds(args.creds, require_paas=(args.action == "deploy"))
-    if args.action == "deploy":
-        conn = dt_connection_info(creds, args.network_zone)
+    if args.action in ("deploy", "update"):
         args._resolved_version = resolve_oneagent_version(args.oneagent_version)
         log(f"[sidecar] OneAgent codemodules tag: {args._resolved_version}")
+    if args.action == "deploy":
+        conn = dt_connection_info(creds, args.network_zone)
+    # Conversion is risky — force serial so a bad convert can't fan out.
+    if args.action == "deploy" and args.allow_convert and args.parallel > 1:
+        log("[sidecar] --allow-convert forces --parallel 1 (conversion is serialized)", err=True)
+        args.parallel = 1
 
     subs = core.resolve_subscriptions(args)
     records = core.build_app_records(args, subs)
@@ -777,9 +910,9 @@ def main():
                 log(f"    {v['verdict']:34}  {v['name']}: {v['detail']}")
         return
 
-    # ---- deploy / uninstall
+    # ---- deploy / uninstall / update
     state = core.load_state(args.state_file) if args.state_file else {}
-    done_statuses = {"deployed", "uninstalled"}
+    done_statuses = {"deployed", "uninstalled", "updated"}
     actionable = [a for a in containers if state.get(a["id"]) not in done_statuses]
     skipped_state = len(containers) - len(actionable)
     if skipped_state:
@@ -797,6 +930,8 @@ def main():
     def run_one(a):
         if args.action == "deploy":
             res = sidecar_deploy_one(a, creds, conn, args)
+        elif args.action == "update":
+            res = sidecar_update_one(a, args)
         else:
             res = sidecar_uninstall_one(a, args)
         if args.state_file:
@@ -809,7 +944,8 @@ def main():
             log(f"[sidecar] {res['name']} -> {res['status']}: {res['detail']}")
             results.append((a, res))
 
-    ok = sum(1 for _, x in results if x["status"] in ("deployed", "uninstalled", "would-deploy", "would-uninstall"))
+    ok = sum(1 for _, x in results if x["status"] in ("deployed", "uninstalled", "updated",
+             "would-deploy", "would-uninstall", "would-update"))
     log(f"\n[sidecar] {args.action} done: {ok}/{len(results)} ok")
     for _, x in results:
         if x["status"] in ("error", "needs-input", "needs-conversion", "needs-storage", "needs-review"):
