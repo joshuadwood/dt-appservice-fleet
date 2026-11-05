@@ -406,7 +406,7 @@ def _registry_auth_props(args):
     raise SystemExit(f"--registry-auth must be anonymous | system-identity | user-assigned:<clientId> (got {ra})")
 
 
-def _dt_settings(app, conn, args, version):
+def _dt_settings(app, conn, args, version, tenant_token=None):
     name = app["name"]
     tags = [f"azure.app_service_name={name}", "managed-by=dt-fleet",
             f"env={args.env_tag}", "dt-path=sidecar"]
@@ -415,7 +415,7 @@ def _dt_settings(app, conn, args, version):
     s = {
         "DT_CONNECTION_POINT": conn["connection_point"],
         "DT_TENANT": conn["tenant"],
-        "DT_TENANTTOKEN": conn["tenant_token"],
+        "DT_TENANTTOKEN": tenant_token or conn["tenant_token"],
         "DT_TAGS": " ".join(tags),
         "DT_LOGSTREAM": "stdout",
         "DT_LOGLEVELCON": "INFO",
@@ -542,7 +542,11 @@ def sidecar_deploy_one(app, creds, conn, args):
                 log(f"    [{name}] removing {len(stash)} App Insights setting(s)...")
                 core.arm_delete_appsettings(app, list(stash.keys()))
 
-        settings = _dt_settings(app, conn, args, version)
+        token = None
+        if args.keyvault_ref:
+            log(f"    [{name}] storing tenant token in Key Vault '{args.keyvault_ref}'...")
+            token = kv_secret_ref(args.keyvault_ref, name, conn["tenant_token"])
+        settings = _dt_settings(app, conn, args, version, tenant_token=token)
         settings.update(extra)
         log(f"    [{name}] 1/5 writing {len(settings)} DT_* app setting(s) (no LD_PRELOAD yet)...")
         core.arm_set_appsettings(app, settings)
@@ -658,9 +662,12 @@ def sidecar_uninstall_one(app, args):
         app["_revert_note"] = reverted
         log(f"    [{name}] 3/4 restart...")
         core.arm_restart(app)
-        log(f"    [{name}] 4/4 done (note: /home/dynatrace agent files remain on shared storage)")
+        pruned = prune_old_versions(app, keep=None) if getattr(args, "prune_old_versions", False) else 0
+        tail = (f"; pruned {pruned} version dir(s)" if pruned
+                else " (note: /home/dynatrace agent files remain on shared storage)")
+        log(f"    [{name}] 4/4 done{tail}")
         result["status"] = "uninstalled"
-        result["detail"] = f"removed sidecar + {len(remove)} setting(s){app.get('_revert_note','')}"
+        result["detail"] = f"removed sidecar + {len(remove)} setting(s){app.get('_revert_note','')}{(' + pruned ' + str(pruned)) if pruned else ''}"
     except Exception as e:  # noqa: BLE001
         result["status"] = "error"
         result["detail"] = redact(str(e))
@@ -762,12 +769,90 @@ def sidecar_update_one(app, args):
         _wait_sidecar(app, args)
         core.arm_restart(app)
         core.arm_set_appsettings(app, {"DT_FLEET_SIDECAR_VERSION": new})
+        pruned = prune_old_versions(app, keep=new) if args.prune_old_versions else 0
         result["status"] = "updated"
-        result["detail"] = f"{old} -> {new} (old versions remain under /home/dynatrace)"
+        result["detail"] = (f"{old} -> {new}"
+                            + (f"; pruned {pruned} old version(s)" if pruned
+                               else " (old versions remain under /home/dynatrace)"))
     except Exception as e:  # noqa: BLE001
         result["status"] = "error"
         result["detail"] = redact(str(e))
     return result
+
+
+# ---- Phase 3 extras: slots, Key Vault refs, version pruning -------------------
+
+def _expand_slots(containers):
+    """Return extra pseudo-records for each app's deployment slots. A slot's resource id
+    is {app_id}/slots/{slot}; all the ARM calls (sitecontainers/appsettings/restart) and
+    the health probe work against that id unchanged, so the normal deploy/verify/uninstall
+    flow applies to slots as-is."""
+    extra = []
+    for app in containers:
+        if app.get("_slot"):
+            continue
+        res = core.arm_resource("GET", app["id"], "/slots", subscription=app["subscription_id"])
+        for v in (res.get("value", []) if isinstance(res, dict) else []):
+            slot = (v.get("name", "") or "").split("/")[-1]
+            if not slot:
+                continue
+            rec = dict(app)
+            rec["id"] = f"{app['id']}/slots/{slot}"
+            rec["name"] = f"{app['name']}[{slot}]"
+            rec["_slot"] = slot
+            for k in ("sidecar", "app_settings", "_scm_host", "_app_host",
+                      "sidecar_status", "deployable_sidecar"):
+                rec.pop(k, None)
+            extra.append(rec)
+    return extra
+
+
+def kv_secret_ref(vault, app_name, token):
+    """Ensure a Key Vault secret holds the tenant token; return an app-setting Key Vault
+    reference (@Microsoft.KeyVault(SecretUri=...)). The data plane isn't on
+    management.azure.com, so this uses `az keyvault secret set` with the running identity;
+    the APP's managed identity still needs secret `get` on the vault for the reference to
+    resolve at runtime (the tool does not grant that — surface it to the operator)."""
+    secret = ("dt-tenanttoken-" + app_name).replace("_", "-").replace("[", "-").replace("]", "")[:120]
+    out = core.run_az(["keyvault", "secret", "set", "--vault-name", vault,
+                       "--name", secret, "--value", token, "-o", "json"])
+    sid = out.get("id", "") if isinstance(out, dict) else ""
+    base = sid.rsplit("/", 1)[0] if sid else f"https://{vault}.vault.azure.net/secrets/{secret}"
+    return f"@Microsoft.KeyVault(SecretUri={base}/)"
+
+
+def kudu_command(app, command, cwd="/home"):
+    """Run a shell command in the app container via the Kudu command API (ARM bearer)."""
+    url = f"https://{core.scm_host(app)}/api/command"
+    body = json.dumps({"command": command, "dir": cwd}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {core.arm_token(app.get('subscription_id'))}",
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:  # noqa: BLE001
+        return {"Error": str(e)}
+
+
+def prune_old_versions(app, keep=None):
+    """Remove stale OneAgent version dirs under /home/dynatrace/oneagent (keeps 'active',
+    'work', and `keep`). Demo-grade, via Kudu (needs SCM reachable). Returns count removed."""
+    raw = core.kudu_get(app, "dynatrace/oneagent/")
+    if raw is None:
+        log(f"    [{app['name']}] prune: SCM/Kudu unreachable — skipped", err=True)
+        return 0
+    try:
+        dirs = [x.get("name", "") for x in json.loads(raw)]
+    except Exception:  # noqa: BLE001
+        return 0
+    verpat = re.compile(r"^\d+\.\d+\.\d+\.\d{8}-\d{6}$")
+    stale = [d for d in dirs if verpat.match(d) and d != keep]
+    for d in stale:
+        kudu_command(app, f"rm -rf /home/dynatrace/oneagent/{d}")
+    if stale:
+        log(f"    [{app['name']}] pruned {len(stale)} old version(s): {', '.join(stale)}")
+    return len(stale)
 
 
 def build_parser():
@@ -813,7 +898,9 @@ def build_parser():
     p.add_argument("--disable-app-insights", action="store_true", help="remove conflicting App Insights settings (stashed for uninstall)")
     p.add_argument("--allow-convert", action="store_true", help="permit converting legacy DOCKER| apps to sitecontainers (forces --parallel 1)")
     p.add_argument("--revert-conversion", action="store_true", help="uninstall: also restore a converted app back to its original DOCKER| mode")
-    p.add_argument("--include-slots", action="store_true", help="(Phase 3) also apply to deployment slots")
+    p.add_argument("--include-slots", action="store_true", help="also apply to every deployment slot (default: production only)")
+    p.add_argument("--keyvault-ref", metavar="VAULT", help="store DT_TENANTTOKEN as a Key Vault reference: creates/updates a secret in <VAULT> and writes @Microsoft.KeyVault(...). The app's managed identity must have secret get access.")
+    p.add_argument("--prune-old-versions", action="store_true", help="update/uninstall: remove stale OneAgent version dirs under /home/dynatrace (keeps active; via Kudu — needs SCM reachable)")
     # deploy/verify controls
     p.add_argument("--force", action="store_true", help="re-apply to apps already carrying a Dynatrace sidecar")
     p.add_argument("--verify", action="store_true", help="deploy: confirm injection inline after deploying")
@@ -884,6 +971,11 @@ def main():
     if not containers:
         log("[sidecar] no container apps matched — nothing to do.")
         return
+    if args.include_slots:
+        slots = _expand_slots(containers)
+        if slots:
+            log(f"[sidecar] --include-slots: +{len(slots)} deployment slot(s)")
+            containers += slots
 
     workers = max(1, args.parallel) if core.USE_REST else 1
     log(f"[sidecar] probing readiness for {len(containers)} app(s)"
