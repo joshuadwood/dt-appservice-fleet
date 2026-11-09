@@ -1285,6 +1285,11 @@ ORYX_PRESERVE_RUNTIMES = {"nodejs", "python"}
 
 DT_MARKER = "dt-oneagent-install.sh"
 
+# Deterministic path of the PaaS-installed agent when the resilient wrapper installs to
+# /home/dynatrace (installer nesting: target/dynatrace/oneagent/...). Used by the
+# --leave-startup-command mode to set LD_PRELOAD as an app setting without needing Kudu.
+PRELOAD_LIB_HOME = "/home/dynatrace/dynatrace/oneagent/agent/lib64/liboneagentproc.so"
+
 
 def _looks_instrumented(startup):
     """True if a startup command already launches via a OneAgent installer wrapper
@@ -1492,6 +1497,11 @@ def deploy_one(app, creds, args):
         settings_dict["DT_LOCALTOVIRTUALHOSTNAME"] = \
             args.host_name.format(name=name, rg=rg, sub=app["subscription_id"])
 
+    # --leave-startup-command: the wrapper is only the one-boot installer; it must land the
+    # agent on /home (so force the resilient install path), then deploy_one reverts the
+    # startup command and injects via an LD_PRELOAD app setting instead.
+    leave_startup = getattr(args, "leave_startup_command", False)
+
     # Wrapper selection:
     #   --preserve-oryx -> regenerate the platform's own launch via Oryx at boot
     #   --resilient     -> persist agent to /home + fail-open, exec START_APP_CMD
@@ -1499,7 +1509,7 @@ def deploy_one(app, creds, args):
     if use_oryx:
         wrapper = STARTUP_WRAPPER_ORYX
         settings_dict["WEBSITES_ENABLE_APP_SERVICE_STORAGE"] = "true"
-    elif args.resilient:
+    elif args.resilient or leave_startup:
         wrapper = STARTUP_WRAPPER_RESILIENT
         settings_dict["WEBSITES_ENABLE_APP_SERVICE_STORAGE"] = "true"
     else:
@@ -1512,6 +1522,12 @@ def deploy_one(app, creds, args):
 
     if args.what_if:
         result["status"] = "would-deploy"
+        if leave_startup:
+            tgt = "(Oryx auto-detect)" if use_oryx else f"'{start_cmd}'"
+            result["detail"] = (f"leave-startup: install agent to /home, then KEEP startup {tgt} "
+                                f"+ inject via LD_PRELOAD app setting  include={include}"
+                                + (" via-REST" if USE_REST else ""))
+            return result
         extra = ("".join([" preserve-oryx(auto-detect,/home,fail-open)" if use_oryx else
                           (" resilient(/home,fail-open)" if args.resilient else ""),
                           " via-REST" if USE_REST else ""]))
@@ -1569,9 +1585,35 @@ def deploy_one(app, creds, args):
             arm_restart(app)
         else:
             run_az(["webapp", "restart", "--ids", app["id"], "-o", "none"])
-        result["status"] = "deployed"
-        result["detail"] = (f"include={include} startup=Oryx-auto-detect" if use_oryx
-                            else f"include={include} START_APP_CMD='{start_cmd}'")
+
+        if leave_startup:
+            # The agent is now installed on /home via the wrapper. Confirm it landed, then
+            # drop the wrapper: restore the app's ORIGINAL startup command and inject the
+            # agent via an LD_PRELOAD app setting instead. Steady state = untouched command.
+            orig_cmd = "" if use_oryx else (start_cmd or "")
+            log(f"    [{name}] 5/6 confirming agent on /home, then restoring startup "
+                f"command {'(Oryx auto-detect)' if not orig_cmd else repr(orig_cmd)}...")
+            present = wait_agent_on_home(app, timeout=getattr(args, "restart_wait", 45) + 150)
+            if present is False:
+                raise RuntimeError("agent did not appear on /home within the wait — not "
+                                   "dropping the install wrapper (re-run to retry)")
+            if USE_REST:
+                arm_set_startup(app, orig_cmd)
+                arm_set_appsettings(app, {"LD_PRELOAD": PRELOAD_LIB_HOME, "DT_FLEET_PRELOAD": "1"})
+            else:
+                run_az(["webapp", "config", "set", "--ids", app["id"],
+                        "--startup-file", orig_cmd, "-o", "none"])
+                run_az(["webapp", "config", "appsettings", "set", "--ids", app["id"], "--settings",
+                        f"LD_PRELOAD={PRELOAD_LIB_HOME}", "DT_FLEET_PRELOAD=1", "-o", "none"])
+            log(f"    [{name}] 6/6 restart (run app under original command + LD_PRELOAD)...")
+            arm_restart(app) if USE_REST else run_az(["webapp", "restart", "--ids", app["id"], "-o", "none"])
+            result["status"] = "deployed"
+            result["detail"] = (f"include={include} LD_PRELOAD app-setting; startup command "
+                                + ("left as Oryx auto-detect" if not orig_cmd else f"restored to '{orig_cmd}'"))
+        else:
+            result["status"] = "deployed"
+            result["detail"] = (f"include={include} startup=Oryx-auto-detect" if use_oryx
+                                else f"include={include} START_APP_CMD='{start_cmd}'")
     except Exception as e:  # noqa: BLE001
         result["status"] = "error"
         result["detail"] = redact(str(e))
@@ -1590,7 +1632,11 @@ def uninstall_one(app, args):
     keys = ["DT_ENDPOINT", "DT_API_TOKEN", "DT_INCLUDE", "DT_FLAVOR",
             "START_APP_CMD", "DT_LOGSTREAM", "DT_LOGLEVELCON", "OTEL_SERVICE_NAME",
             "OTEL_RESOURCE_ATTRIBUTES", "DT_LOCALTOVIRTUALHOSTNAME",
-            "DT_TAGS", "DT_FLEET_ORIG_STARTUP"]
+            "DT_TAGS", "DT_FLEET_ORIG_STARTUP", "DT_FLEET_PRELOAD"]
+    # --leave-startup-command mode injects via an LD_PRELOAD app setting; remove it too
+    # (only if it's ours — never clobber a foreign LD_PRELOAD).
+    if settings.get("LD_PRELOAD") == PRELOAD_LIB_HOME or settings.get("DT_FLEET_PRELOAD"):
+        keys.append("LD_PRELOAD")
     try:
         log(f"    [{name}] 1/3 restoring original startup command ('{orig or '(empty)'}')...")
         if USE_REST:
@@ -1668,6 +1714,38 @@ def app_http_ok(app, tries=3, delay=10):
         if i < tries - 1:
             time.sleep(delay)
     vlog(f"[{app['name']}] health probe: app appears DOWN (last={last})")
+    return False
+
+
+def _agent_on_home(app):
+    """True if the PaaS agent .so is present on /home (resilient install finished), False
+    if not, None if the mount is unreadable (SCM IP-restricted). Light dir-listing check."""
+    raw = kudu_get(app, "dynatrace/dynatrace/oneagent/agent/lib64/")
+    if raw is None:
+        return False if kudu_get(app, "") is not None else None
+    try:
+        return any(x.get("name") == "liboneagentproc.so" for x in json.loads(raw))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def wait_agent_on_home(app, timeout=180):
+    """Block until the agent .so is on /home (so --leave-startup-command can safely drop
+    the install wrapper). Polls when SCM is reachable; otherwise waits blind and warns.
+    Returns True (present) / False (timed out) / None (couldn't check)."""
+    first = _agent_on_home(app)
+    if first is None:
+        log(f"    [{app['name']}] (SCM unreadable — can't confirm agent on /home; waiting "
+            f"{timeout}s blind before dropping the install wrapper)", err=True)
+        time.sleep(timeout)
+        return None
+    waited = 0
+    while waited < timeout:
+        if _agent_on_home(app) is True:
+            return True
+        step = min(15, timeout - waited)
+        time.sleep(step)
+        waited += step
     return False
 
 
@@ -1960,6 +2038,11 @@ def main():
                    help="deploy --verify: if an app is NOT serving HTTP after the verify window "
                         "(our startup change broke it), automatically uninstall to restore its prior "
                         "state — so a deploy can never leave an app crash-looping. Use with --preserve-oryx.")
+    p.add_argument("--leave-startup-command", action="store_true",
+                   help="instrument WITHOUT owning the Startup Command: install the agent to /home (one "
+                        "install boot), then restore the app's ORIGINAL startup command and inject via an "
+                        "LD_PRELOAD app setting instead of a wrapper. Steady state = your exact command + "
+                        "LD_PRELOAD + agent on /home. Implies /home persistence.")
     p.add_argument("--env-tag", default="demo", help="value for DT_TAGS env=")
     p.add_argument("--service-name", help="OTEL_SERVICE_NAME for the Dynatrace service entity; supports {name}/{rg}/{sub} placeholders (default: the app's site name)")
     p.add_argument("--otel-resource-attributes", help="OTEL_RESOURCE_ATTRIBUTES, e.g. 'service.namespace=retail,deployment.environment=prod'")
