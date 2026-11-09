@@ -12,6 +12,21 @@ cd /root/azure-linux-app-services
 ```
 Needs: `python3`, `az`, `curl`, `jq`. Add `--rest` to any command to bypass the slow `az` CLI.
 
+## Unified tool (handles code *and* container apps)
+
+`dt_appservice.py` auto-routes each app — **code → code path, container → sidecar path** —
+so one command covers a mixed fleet:
+
+```bash
+python3 dt_appservice.py assess --all-subscriptions --rest                       # dry run, see routing
+python3 dt_appservice.py deploy --subscription prod --rest --yes --verify --rollback-on-fail
+# code apps, keep the startup command untouched (inject via LD_PRELOAD app setting):
+python3 dt_appservice.py deploy --subscription prod --rest --yes --leave-startup-command --verify --rollback-on-fail
+```
+The sections below use the per-path tools directly; the unified tool takes the same flags
+and routes them. (A sidecar only attaches to Publish: Container apps, so code apps always
+get the startup-command / LD_PRELOAD route — never a sidecar.)
+
 ## 1. Assess first (dry run — never changes anything)
 
 ```bash
@@ -132,6 +147,7 @@ python3 dt_appservice_fleet.py uninstall \
 | `--start-app-cmd "<cmd>"` | launch command for apps with **no** startup command (Oryx implicit default) |
 | `--discover-start-cmd` | auto-detect that launch command from the app's files (package.json / Python entrypoint) — review with `--what-if` |
 | `--preserve-oryx` | **Node/Python, no startup command, SCM locked down:** inject the agent, then let the platform's own Oryx auto-detect run the app at boot — **no command or SCM access needed.** Handles compressed Oryx builds. Pair with `--rollback-on-fail`. |
+| `--leave-startup-command` | **Instrument without owning the Startup Command:** install the agent to `/home`, then restore the app's original command and inject via an `LD_PRELOAD` app setting. Steady state = your exact command, untouched. |
 | `--rollback-on-fail` | with `--verify`: if an app isn't serving HTTP after deploy (our change broke it), **auto-uninstall to restore it** — a deploy can never leave an app down. |
 | `--set-host-tag K=V` | extra Dynatrace `[Environment]K:V` tag (repeatable) |
 | `--detailed` | assess: fetch per-app startup cmd + DT state |

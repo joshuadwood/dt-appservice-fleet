@@ -1054,10 +1054,12 @@ def main():
                     log(f"    {v['verdict']:34}  {v['name']}: {v['detail']}")
                     verdicts[a["name"]] = (a, v)
             if args.rollback_on_fail:
-                log(f"\n[rollback] probing HTTP health of {len(verdicts)} app(s) (independent of agent verdict)...")
+                log(f"\n[rollback] health-probing apps not already Dynatrace-confirmed...")
                 rolled = 0
                 for nm, (a, v) in verdicts.items():
-                    if core.app_http_ok(a):
+                    # Trust a CONFIRMED (Dynatrace) verdict — app served traced traffic; don't
+                    # revert on a transient cold-start HTTP timeout. Probe the rest.
+                    if v["verdict"].startswith("CONFIRMED") or core.app_http_ok(a):
                         continue
                     log(f"    [{nm}] NOT serving HTTP (verdict '{v['verdict']}') — rolling back...", err=True)
                     rb = sidecar_uninstall_one(a, args)

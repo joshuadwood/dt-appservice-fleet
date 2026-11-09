@@ -2266,12 +2266,14 @@ def main():
             # down. "Agent loaded" is NOT "app running"; only an HTTP probe tells us the
             # app is actually serving.
             if args.rollback_on_fail:
-                log(f"\n[rollback] probing HTTP health of {len(verdicts)} deployed app(s) "
-                    f"(independent of agent verdict)...")
+                log(f"\n[rollback] health-probing deployed app(s) not already Dynatrace-confirmed...")
                 rolled = 0
                 for name, (a, v) in verdicts.items():
-                    if app_http_ok(a):
-                        continue   # serving HTTP — fine (agent may still be cold; not a reason to revert)
+                    # Trust a CONFIRMED (Dynatrace) verdict — the app served traced traffic, so
+                    # a transient cold-start HTTP timeout is not a reason to revert. Probe the rest
+                    # (e.g. INSTRUMENTED = agent loaded but app liveness unverified).
+                    if v["verdict"].startswith("CONFIRMED") or app_http_ok(a):
+                        continue   # confirmed up, or serving HTTP — not a reason to revert
                     log(f"    [{name}] NOT serving HTTP after deploy "
                         f"(verdict was '{v['verdict']}') — rolling back...", err=True)
                     rb = uninstall_one(a, args)

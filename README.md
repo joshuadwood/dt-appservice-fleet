@@ -15,13 +15,52 @@ Credentials (`dtApiEnvUrl`, `dtPaasToken`) are read from `creds.json`.
 
 | File | Purpose |
 |---|---|
-| `dt_appservice_fleet.py` | **Main tool (code path).** `assess` / `deploy` / `verify` / `uninstall` for Linux **code/built-in-image** apps, across subscriptions. |
-| `dt_appservice_sidecar.py` | **Sidecar path (containers).** `assess` / `deploy` / `verify` / `uninstall` / `update` for **containerized (BYOC)** Linux apps via the bootstrapper sidecar. See [Container apps (sidecar path)](#container-apps-sidecar-path). |
+| `dt_appservice.py` | **Unified entry (recommended).** One `assess`/`deploy`/`verify`/`uninstall`/`update` that **auto-routes each app**: Publish: Code → code path, Publish: Container → sidecar path. See [Unified tool](#unified-tool-code--container). |
+| `dt_appservice_fleet.py` | Code path (built-in image) — used directly or via the unified tool. `assess`/`deploy`/`verify`/`uninstall`. |
+| `dt_appservice_sidecar.py` | Sidecar path (containers/BYOC) — used directly or via the unified tool. `assess`/`deploy`/`verify`/`uninstall`/`update`. See [Container apps (sidecar path)](#container-apps-sidecar-path). |
 | `provision_demo_apps.sh` | Stand up 4 demo App Services (2 Python, 2 Node — distinct frameworks). |
 | `provision_demo_containers.sh` | Stand up demo **container** Web Apps (sitecontainers + legacy DOCKER\| modes) for the sidecar path. |
 | `generate_load.py` | Drive CRUD traffic against the apps so OneAgent has requests to trace. |
 | `apps/` | Source for the 4 demo apps (Express, Fastify, Flask, FastAPI). |
 | `reports/` | Generated assessment reports (`.md` / `.json` / `.csv`). |
+
+---
+
+## Unified tool (code + container)
+
+`dt_appservice.py` is the recommended entry point: **one command over a mixed fleet** that
+inventories once, classifies each app by its Azure **Publish** model, and dispatches to the
+mechanism that actually works for it (a sidecar can only attach to a Publish: Container app
+— Azure requires it — so code apps never go down the sidecar path):
+
+| Publish model | Route | How the agent loads |
+|---|---|---|
+| **Code** (built-in image) | code path | startup-command wrapper, **or** `--leave-startup-command` (LD_PRELOAD app setting, command untouched), **or** `--preserve-oryx` |
+| **Container** (BYOC) | sidecar path | `dynatrace-codemodules` bootstrapper sidecar + LD_PRELOAD app setting |
+
+```bash
+# one dry run across everything — see how each app would be routed
+python3 dt_appservice.py assess --all-subscriptions --rest
+
+# deploy the whole mixed fleet; each app auto-routed, with inline verify + auto-rollback
+python3 dt_appservice.py deploy --subscription prod --rest --yes --verify --rollback-on-fail
+
+# code apps: keep their startup command, inject via LD_PRELOAD (containers ignore this flag)
+python3 dt_appservice.py deploy --subscription prod --rest --yes --leave-startup-command \
+    --verify --rollback-on-fail
+```
+
+Every flag of both paths is accepted; each app consumes only the ones relevant to its route
+(`--leave-startup-command`/`--preserve-oryx`/`--start-app-cmd` for code; `--allow-convert`/
+`--enable-storage`/`--technology`/`--oneagent-version`/… for containers). `update` targets
+the sidecar (container) apps. The two underlying tools remain usable standalone.
+
+**Instrumenting code apps without touching the Startup Command.** `--leave-startup-command`
+installs the agent to `/home` in one install boot, then **restores the app's original
+startup command** and injects via an `LD_PRELOAD` app setting (same model the Dynatrace
+Kubernetes Operator uses). Steady state = your exact command + `LD_PRELOAD` + agent on
+`/home`; the wrapper is only transient. Trade-off: `LD_PRELOAD` is container-wide and
+updates are manual — vs the default wrapper which owns the command but is self-installing.
 
 ---
 
