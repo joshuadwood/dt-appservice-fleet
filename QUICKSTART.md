@@ -199,8 +199,9 @@ az role assignment create --assignee you@tenant.com --role "DT Fleet Deployer" \
 
 ## Good to know
 
-- **Always `assess` before `deploy`.** Deploy only touches **Linux code** apps;
-  Function Apps and containers are reported and skipped.
+- **Always `assess` before `deploy`.** The `dt_appservice_fleet.py` deploy below touches
+  **Linux code** apps (containers/Function Apps reported and skipped). For containers use
+  `dt_appservice_sidecar.py`, or let `dt_appservice.py` route both automatically.
 - **Idempotent + resumable.** Re-running `deploy` skips already-instrumented apps;
   with `--state-file` it also skips apps completed in a prior run.
 - **"Seems stuck"?** Add `-v`. On a starved host `az` takes 100–200s/call — use

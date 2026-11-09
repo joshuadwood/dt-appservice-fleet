@@ -1,8 +1,16 @@
 # Dynatrace OneAgent — Azure Linux App Service Fleet Toolkit
 
-Automated, at-scale deployment of the Dynatrace OneAgent to Azure App Service
-for **Linux (built-in image / code deploy)**, plus the assessment tooling to
-decide *where* it can go.
+Automated, at-scale deployment of the Dynatrace OneAgent to **any Linux Azure App
+Service** — both **Publish: Code** (built-in image) and **Publish: Container** (BYOC) —
+plus the assessment tooling to decide *where* it can go and *how*.
+
+One unified entry point (`dt_appservice.py`) auto-routes each app to the mechanism Azure
+actually allows for it:
+
+- **Publish: Code** → startup-command wrapper, **or** `--leave-startup-command` (inject via
+  an `LD_PRELOAD` app setting, Startup Command untouched), **or** `--preserve-oryx`.
+- **Publish: Container** → the `dynatrace-codemodules` **bootstrapper sidecar** (a sidecar
+  can only attach to a container app — Azure requires it — so code apps never get one).
 
 Target Dynatrace environment: `qof78400` (`https://qof78400.live.dynatrace.com`).
 Credentials (`dtApiEnvUrl`, `dtPaasToken`) are read from `creds.json`.
@@ -127,8 +135,11 @@ on the `az` path. The JSON report includes `estimated_deploy_seconds` for script
 
 ## 2. Deploy OneAgent
 
-Mutating. Instruments **Linux code** Web Apps only. Deploy honors every gotcha in
-`dynatrace-appservice-linux-gotchas.md` (see "How instrumentation works" below).
+Mutating. This section covers the **code path** (`dt_appservice_fleet.py`) — Linux
+**Publish: Code** Web Apps. Container apps go through the [sidecar path](#container-apps-sidecar-path),
+and the [unified tool](#unified-tool-code--container) routes either automatically. Deploy
+honors every gotcha in `dynatrace-appservice-linux-gotchas.md` (see "How instrumentation
+works" below).
 
 ```bash
 # instrument the 4 demo apps
@@ -142,9 +153,11 @@ python3 dt_appservice_fleet.py deploy --app-service-name dtfleet --what-if
 
 Useful knobs: `--dt-include` (override the per-runtime tech), `--dt-flavor`
 (`default` glibc / `musl` Alpine), `--start-app-cmd` (required for apps that had
-*no* existing Startup Command — see Node gotcha), `--env-tag`, `--restart-wait`,
-`-v/--verbose` (echo every `az` call with timing + applied values, tokens redacted),
-`--rest` (ARM REST fast path for reads).
+*no* existing Startup Command — see Node gotcha), `--resilient` (persist agent to
+`/home`, fail-open), `--leave-startup-command` (instrument via an `LD_PRELOAD` app
+setting and leave the Startup Command untouched — see [Unified tool](#unified-tool-code--container)),
+`--rollback-on-fail` (auto-revert an app left not-serving after `--verify`),
+`--env-tag`, `--restart-wait`, `-v/--verbose`, `--rest`.
 
 **Apps with no Startup Command (Oryx implicit default).** The wrapper must `exec` a
 real launch command. Two ways to supply it:
@@ -361,11 +374,13 @@ Then the app is **restarted twice** (once to install, once to instrument).
    touched — the startup/LD_PRELOAD path does nothing there.
 2. **Startup command *swap*, not chain.** The real launch command moves into
    `START_APP_CMD`; the wrapper execs it as its final step with `LD_PRELOAD` set.
-3. **`LD_PRELOAD` is inline, never an app setting.** A container-wide
-   `LD_PRELOAD` app setting fires before `/opt/dynatrace` exists and spams
-   `cannot be preloaded` errors on oryx/wget/sh. We set it inline for the app
-   process only. *(This is the one correction vs. the attached screenshot, which
-   used an `LD_PRELOAD` app setting — the sidecar-tab pattern.)*
+3. **`LD_PRELOAD` is inline by default, never set before the agent exists.** A
+   container-wide `LD_PRELOAD` app setting that fires before the `.so` is present
+   spams `cannot be preloaded` errors on oryx/wget/sh, so the default wrapper sets
+   it inline for the app process only. **Exception — `--leave-startup-command`**
+   *deliberately* uses an `LD_PRELOAD` app setting, but only **after** staging the
+   agent on `/home`, so there is no missing-`.so` window (and the sidecar path uses
+   it too, since the customer image's entrypoint can't be touched).
 4. **`START_APP_CMD` must be explicit.** An app that relied on the image's
    implicit default start will not start once a Startup Command is present, so we
    capture the existing command (and refuse, with `needs-input`, when there is
