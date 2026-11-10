@@ -1,5 +1,8 @@
 # Dynatrace OneAgent — Azure Linux App Service Fleet Toolkit
 
+> ⚠️ **Disclaimer:** These are field-developed community scripts. They are **not** official
+> Dynatrace tools and are **not** supported by Dynatrace. Use at your own discretion.
+
 Automated, at-scale deployment of the Dynatrace OneAgent to **any Linux Azure App
 Service** — both **Publish: Code** (built-in image) and **Publish: Container** (BYOC) —
 plus the assessment tooling to decide *where* it can go and *how*.
