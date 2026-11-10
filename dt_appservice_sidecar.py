@@ -237,11 +237,58 @@ def sidecar_readiness(app, sidecar_name=DEFAULT_SIDECAR_NAME, tech_map=None):
     r["technology_hint"] = technology_hint(r["main_image"], settings, tech_map, app["name"])
     r["alpine_hint"] = any(t in (r["main_image"] or "").lower() for t in ("alpine", "musl"))
 
+    # conversion-risk inputs (used by _conversion_risks / the convert preflight)
+    r["websites_port"] = settings.get("WEBSITES_PORT") or ""
+    r["registry_private"] = bool(settings.get("DOCKER_REGISTRY_SERVER_USERNAME")
+                                 or str(cfg.get("acrUseManagedIdentityCreds", "")).lower() == "true")
+    r["sku_small"] = r["sku_tier"].lower() in ("basic",)
+    r["conversion_risks"] = _conversion_risks(r, settings)
+
     app["sidecar"] = r
     app["dt_instrumented"] = r["dt_instrumented"]
     app["sidecar_status"], app["sidecar_reason"], app["deployable_sidecar"] = \
         classify_sidecar_status(app, r)
     return r
+
+
+def _conversion_risks(r, settings):
+    """Preflight for the 6 application-level risks of a legacy DOCKER| -> sitecontainers
+    conversion. Returns a list of (code, severity, message). severity:
+      'block' — must be resolved before converting (e.g. pass --target-port);
+      'warn'  — proceed, but verify;  'info' — inherent to conversion, FYI."""
+    risks = []
+    legacy = r["container_mode"] == "legacy-single"
+    if legacy:
+        # R2 — port: sitecontainers needs an explicit targetPort. Legacy mode auto-detects
+        # the port; if WEBSITES_PORT isn't set we'd guess 80 and mis-route a non-80 app.
+        if not r.get("websites_port"):
+            risks.append(("port", "block",
+                          "no WEBSITES_PORT — the container port can't be inferred; it would "
+                          "default to 80 and mis-route a non-80 app. Set WEBSITES_PORT or pass "
+                          "--target-port <n>."))
+        # R3 — private-registry pull credentials carried onto the main container
+        if r.get("registry_private"):
+            risks.append(("registry", "warn",
+                          "private registry — pull credentials are carried to the main "
+                          "container; verify they still resolve after conversion."))
+        # R1 — restart / image re-pull
+        risks.append(("restart", "info",
+                      "conversion restarts the app (brief downtime + image re-pull)."))
+        # R4 — legacy app settings become inert
+        if r.get("websites_port") or settings.get("DOCKER_REGISTRY_SERVER_URL"):
+            risks.append(("inert", "info",
+                          "WEBSITES_PORT / DOCKER_REGISTRY_SERVER_* become inert (their values "
+                          "move into the sitecontainer resource)."))
+        # R6 — IaC drift (can't be detected programmatically; always advise)
+        risks.append(("iac", "info",
+                      "if ARM/Bicep/Terraform manages this app, re-applying its template "
+                      "reverts it to DOCKER| mode."))
+    # R5 — SKU headroom: conversion adds a sidecar alongside the main on the same plan
+    if r.get("sku_small"):
+        risks.append(("sku", "warn",
+                      f"small plan ({r['sku_tier']}) — main + sidecar share limited CPU/RAM; "
+                      f"watch for memory pressure."))
+    return risks
 
 
 def classify_sidecar_status(app, r):
@@ -328,6 +375,9 @@ def render_sidecar_report(records, fmt="txt"):
                      f"{sc.get('technology_hint','') or '?':8} {sc.get('sku_tier','') or '?':10} "
                      f"{r['subscription_name']}/{r['name']}")
         lines.append(f"{'':17} -> {r.get('sidecar_reason','')}")
+        for code, sev, msg in sc.get("conversion_risks", []):
+            mark = {"block": "✗ BLOCK", "warn": "! warn", "info": "· info"}.get(sev, sev)
+            lines.append(f"{'':17}    {mark} [{code}] {msg}")
     return "\n".join(lines)
 
 
@@ -494,6 +544,18 @@ def sidecar_deploy_one(app, creds, conn, args):
     # first, then re-read readiness so the normal flow continues. Without it, _gate blocks.
     if app.get("sidecar_status") == "needs-conversion" and getattr(args, "allow_convert", False) \
             and not args.what_if:
+        # Conversion-risk preflight: hard-stop on any unresolved 'block' risk (e.g. unknown
+        # port), log 'warn'/'info' so the operator sees them before the app is mutated.
+        blocks = [m for code, sev, m in r.get("conversion_risks", [])
+                  if sev == "block" and not (code == "port" and getattr(args, "target_port", None))]
+        if blocks:
+            result["status"] = "needs-input"
+            result["detail"] = "conversion blocked — " + "; ".join(blocks)
+            return result
+        for code, sev, m in r.get("conversion_risks", []):
+            if not (code == "port" and getattr(args, "target_port", None)):
+                log(f"    [{name}] convert-risk [{sev}] {code}: {m}",
+                    err=(sev in ("block", "warn")))
         try:
             convert_legacy_to_sitecontainers(app, args)
             sidecar_readiness(app, args.sidecar_name)   # re-classify post-conversion
@@ -701,7 +763,11 @@ def convert_legacy_to_sitecontainers(app, args):
     image = linux_fx.split("|", 1)[1] if "|" in linux_fx else app.get("sidecar", {}).get("main_image", "")
     if not image:
         raise RuntimeError("could not determine the container image to convert")
-    port = settings.get("WEBSITES_PORT") or "80"
+    # Port precedence: explicit --target-port > WEBSITES_PORT. The deploy preflight blocks
+    # conversion when neither is known, so we don't silently guess 80 and mis-route.
+    port = getattr(args, "target_port", None) or settings.get("WEBSITES_PORT")
+    if not port:
+        raise RuntimeError("no container port (no --target-port, no WEBSITES_PORT)")
 
     props = {"image": image, "isMain": True, "targetPort": str(port)}
     if startup:
@@ -897,6 +963,7 @@ def build_parser():
     p.add_argument("--allow-alpine", action="store_true", help="proceed on Alpine/musl images (musl support unverified)")
     p.add_argument("--disable-app-insights", action="store_true", help="remove conflicting App Insights settings (stashed for uninstall)")
     p.add_argument("--allow-convert", action="store_true", help="permit converting legacy DOCKER| apps to sitecontainers (forces --parallel 1)")
+    p.add_argument("--target-port", help="container port for the converted main site-container (required when the legacy app has no WEBSITES_PORT)")
     p.add_argument("--revert-conversion", action="store_true", help="uninstall: also restore a converted app back to its original DOCKER| mode")
     p.add_argument("--include-slots", action="store_true", help="also apply to every deployment slot (default: production only)")
     p.add_argument("--keyvault-ref", metavar="VAULT", help="store DT_TENANTTOKEN as a Key Vault reference: creates/updates a secret in <VAULT> and writes @Microsoft.KeyVault(...). The app's managed identity must have secret get access.")

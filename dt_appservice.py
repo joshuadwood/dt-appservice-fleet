@@ -222,6 +222,7 @@ def build_parser():
     p.add_argument("--enable-storage", action="store_true"); p.add_argument("--allow-alpine", action="store_true")
     p.add_argument("--disable-app-insights", action="store_true")
     p.add_argument("--allow-convert", action="store_true"); p.add_argument("--revert-conversion", action="store_true")
+    p.add_argument("--target-port", help="container port for a converted main site-container (if the legacy app has no WEBSITES_PORT)")
     p.add_argument("--include-slots", action="store_true"); p.add_argument("--prune-old-versions", action="store_true")
     p.add_argument("--keyvault-ref", metavar="VAULT")
     return p
