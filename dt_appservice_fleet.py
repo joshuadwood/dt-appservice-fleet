@@ -409,7 +409,12 @@ def arm_webapp_list(subscription_ids, resource_group=None):
                    f"/providers/Microsoft.Web/sites?api-version={ARM_API}")
         else:
             url = f"{ARM}/subscriptions/{sid}/providers/Microsoft.Web/sites?api-version={ARM_API}"
-        out = _arm_call("GET", url, subscription=sid)
+        try:
+            out = _arm_call("GET", url, subscription=sid)
+        except Exception as e:  # noqa: BLE001 — one unreachable subscription must not abort the rest
+            log(f"[inventory] skipping subscription {sid} — not reachable "
+                f"({redact(str(e)).splitlines()[-1][:120]})", err=True)
+            continue
         for v in (out or {}).get("value", []) if isinstance(out, dict) else []:
             props = v.get("properties", {}) or {}
             sc = props.get("siteConfig", {}) or {}
@@ -971,9 +976,15 @@ def build_app_records(args, subs):
                 raw = arm_webapp_list(sub_ids)
         else:
             # Delegated az: tokens are per-subscription (cross-tenant guest/Lighthouse),
-            # so inventory each subscription with its own token.
+            # so inventory each subscription with its own token. A single subscription that
+            # can't mint a token (disabled / stale in `az account list` / foreign tenant)
+            # must not abort the whole fleet — skip it with a warning and continue.
             for sid in sub_ids:
-                raw += graph_inventory([sid], subscription=sid)
+                try:
+                    raw += graph_inventory([sid], subscription=sid)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[inventory] skipping subscription {sid} — not reachable "
+                        f"({redact(str(e)).splitlines()[-1][:120]})", err=True)
             if not graph_matches(raw):
                 log("[inventory] Graph returned no name-filter matches; "
                     "falling back to ARM REST site list (handles indexing lag)...")
